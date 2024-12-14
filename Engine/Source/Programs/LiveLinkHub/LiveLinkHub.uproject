@@ -1,0 +1,12 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "",
+	"Category": "",
+	"Description": "",
+	"TargetPlatforms": [
+		"Linux",
+		"Mac",
+		"Windows"
+	],
+	"DisableEnginePluginsByDefault": true
+}

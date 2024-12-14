@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BuildGraph xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../Build/Graph/Schema.xsd" xmlns="http://www.epicgames.com/BuildGraph">
+  <Option Name="RunReplicationSystemTests" DefaultValue="" Description="Run Replication System Tests" />
+  <Property Name="TestNames" Value="$(TestNames);ReplicationSystem" />
+  <Extend Name="RunAllTests">
+    <Expand Name="DeployAndTest" Platform="Win64" TestName="ReplicationSystem" ShortName="Replication System" TargetName="ReplicationSystemLowLevelTests" BinaryRelativePath="Engine\Binaries" ReportType="console" />
+    <Expand Name="DeployAndTest" Platform="Linux" TestName="ReplicationSystem" ShortName="Replication System" TargetName="ReplicationSystemLowLevelTests" BinaryRelativePath="Engine\Binaries" ReportType="console" />
+    <Expand Name="DeployAndTest" Platform="LinuxArm64" TestName="ReplicationSystem" ShortName="Replication System" TargetName="ReplicationSystemLowLevelTests" BinaryRelativePath="Engine\Binaries" ReportType="console" RunContainerized="True" />
+  </Extend>
+</BuildGraph>

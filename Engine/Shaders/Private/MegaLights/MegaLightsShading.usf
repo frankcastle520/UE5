@@ -1,0 +1,386 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#ifndef TILE_TYPE
+	#define TILE_TYPE TILE_MODE_EMPTY
+#endif
+
+#ifndef NUM_SAMPLES_PER_PIXEL_1D
+	#define NUM_SAMPLES_PER_PIXEL_1D 1
+	#define NUM_SAMPLES_PER_PIXEL_2D_X 1
+	#define NUM_SAMPLES_PER_PIXEL_2D_Y 1
+#endif
+
+// When loading SSS checkerboard pixel, do not adjust DiffuseColor/SpecularColor to preserve specular and diffuse lighting values for each pixel
+#define ALLOW_SSS_MATERIAL_OVERRIDE 0
+
+#define USE_IES_PROFILE 1
+#define USE_LIGHT_FUNCTION_ATLAS 1
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "MegaLightsShading.ush"
+#include "../Lumen/LumenReflectionDenoiserCommon.ush"
+
+ADAPTIVE_LICM
+
+RWTexture2D<float3> RWResolvedDiffuseLighting;
+RWTexture2D<float3> RWResolvedSpecularLighting;
+RWTexture2D<UNORM float> RWShadingConfidence;
+
+int2 SampleViewMin;
+int2 SampleViewSize;
+uint2 DownsampledViewMin;
+uint2 DownsampledViewSize;
+Texture2D<float> DownsampledSceneDepth;
+float2 DownsampledBufferInvSize;
+
+StructuredBuffer<uint> TileAllocator;
+StructuredBuffer<uint> TileData;
+uint TileDataStride;
+
+Texture2D<uint> LightSamples;
+Texture2D<uint> LightSampleUVTexture;
+
+float LightWasHiddenPDFWeightScale;
+uint UseShadingConfidence;
+int UseIESProfiles;
+int UseLightFunctionAtlas;
+uint DebugLightId;
+
+float GetLightSampleWeightRatio(FLightSample LightSample)
+{
+	return (1.0f / LightSample.Weight) * (LightSample.bGuidedAsPartiallyVisibleLight ? 0.25f : 1.0f);
+}
+
+void FindNextLocalLightIndex(uint PackedLightSamples[NUM_SAMPLES_PER_PIXEL_1D], inout uint NextLocalLightIndex, inout float MissWeightRatioSum)
+{
+	for (uint SampleIndex = 0; SampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++SampleIndex)
+	{
+		FLightSample LightSample = UnpackLightSample(PackedLightSamples[SampleIndex]);
+		if (LightSample.bVisible)
+		{
+			NextLocalLightIndex = min(NextLocalLightIndex, LightSample.LocalLightIndex);
+		}
+		else if (LightSample.LocalLightIndex != MAX_LOCAL_LIGHT_INDEX)
+		{
+			MissWeightRatioSum += GetLightSampleWeightRatio(LightSample);
+		}
+	}
+}
+
+void AccumulateLightSample(uint PackedLightSamples[NUM_SAMPLES_PER_PIXEL_1D], uint LocalLightIndex, inout uint NextLocalLightIndex, inout float SampleWeightSum, inout float WeightRatioSum)
+{
+	for (uint SampleIndex = 0; SampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++SampleIndex)
+	{
+		FLightSample LightSample = UnpackLightSample(PackedLightSamples[SampleIndex]);
+		if (LightSample.bVisible)
+		{
+			if (LightSample.LocalLightIndex == LocalLightIndex)
+			{
+				SampleWeightSum += LightSample.Weight;
+				WeightRatioSum += GetLightSampleWeightRatio(LightSample);
+			}
+
+			if (LightSample.LocalLightIndex > LocalLightIndex)
+			{
+				NextLocalLightIndex = min(NextLocalLightIndex, LightSample.LocalLightIndex);
+			}
+		}
+	}
+}
+
+bool IsValidDownsampledCoord(uint2 DownsampledScreenCoord)
+{
+	return all(DownsampledScreenCoord.xy < DownsampledViewMin + DownsampledViewSize);
+}
+
+/**
+ * Upsample light samples and apply all lights per pixel to affected tiles
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ShadeLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TileIndex = GroupId.x;
+	if (TileIndex < TileAllocator[TILE_TYPE])
+	{
+		uint2 TileCoord = UnpackTile(TileData[TileIndex + TILE_TYPE * TileDataStride]);
+		uint2 ScreenCoord = TileCoord * TILE_SIZE + GroupThreadId.xy;
+		uint LocalLightHiMask = 0;
+
+		if (all(ScreenCoord < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+		{
+	#if DEBUG_MODE
+			int2 DebugScreenCoord = GetDebugScreenCoord();
+			bool bDebug = all(ScreenCoord == DebugScreenCoord);
+			FShaderPrintContext Context = InitShaderPrintContext(true, float2(0.55, 0.05));
+	#endif
+
+			const float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+			const bool bForceSimpleShading = IsSimpleShadingTileType(TILE_TYPE);
+			FMegaLightsMaterial Material = LoadMaterial(ScreenUV, ScreenCoord, bForceSimpleShading);
+
+			// #ml_todo: handle this path when shadows are disabled
+			float ScreenSpaceAO = 1.0f;//Texture2DSampleLevel(SceneTexturesStruct.ScreenSpaceAOTexture, SceneTexturesStruct_ScreenSpaceAOTextureSampler, ScreenUV, 0).x;
+
+			float3 DiffuseLighting = INVALID_LIGHTING;
+			float3 SpecularLighting = INVALID_LIGHTING;
+			float WeightRatioSum = 0.0f;
+
+			if (Material.Depth > 0.0f && Material.IsValid())
+			{
+				DiffuseLighting = 0.0f;
+				SpecularLighting = 0.0f;
+
+				float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, Material.Depth);
+				float3 CameraVector = normalize(TranslatedWorldPosition - View.TranslatedWorldCameraOrigin);
+
+				// Prepare weights for upsampling
+				float4 DownsampledScreenWeights = 0.0f;
+				{
+					int2 DownsampledScreenCoord00 = floor(ScreenUV * View.BufferSizeAndInvSize.xy / DOWNSAMPLE_FACTOR - 0.5f);
+					float2 DownsampledGatherUV = (DownsampledScreenCoord00 + 1.0f) * DownsampledBufferInvSize;
+
+					float4 CornerDepths = DownsampledSceneDepth.GatherRed(GlobalPointClampedSampler, DownsampledGatherUV).wzxy;
+
+					int2 ScreenCoordOffset = ScreenCoord - DownsampledScreenCoord00 * 2;
+					int2 SampleOffset00 = GetSampleScreenCoordJitter(DownsampledScreenCoord00 + uint2(0, 0)) + uint2(0, 0) * 2 - ScreenCoordOffset;
+					int2 SampleOffset10 = GetSampleScreenCoordJitter(DownsampledScreenCoord00 + uint2(1, 0)) + uint2(1, 0) * 2 - ScreenCoordOffset;
+					int2 SampleOffset01 = GetSampleScreenCoordJitter(DownsampledScreenCoord00 + uint2(0, 1)) + uint2(0, 1) * 2 - ScreenCoordOffset;
+					int2 SampleOffset11 = GetSampleScreenCoordJitter(DownsampledScreenCoord00 + uint2(1, 1)) + uint2(1, 1) * 2 - ScreenCoordOffset;
+
+					// Triangle filter weights between pixel and 4 samples
+					float4 InterpolationWeights;
+					InterpolationWeights.x = (2.0f - abs(SampleOffset00.x)) * (2.0f - abs(SampleOffset00.y));
+					InterpolationWeights.y = (2.0f - abs(SampleOffset10.x)) * (2.0f - abs(SampleOffset10.y));
+					InterpolationWeights.z = (2.0f - abs(SampleOffset01.x)) * (2.0f - abs(SampleOffset01.y));
+					InterpolationWeights.w = (2.0f - abs(SampleOffset11.x)) * (2.0f - abs(SampleOffset11.y));
+
+					float4 DepthWeights = 0.0f;	
+
+					#define PLANE_WEIGHTING 1
+					#if PLANE_WEIGHTING
+					{
+						float4 ScenePlane = float4(Material.WorldNormalForPositionBias, dot(TranslatedWorldPosition, Material.WorldNormalForPositionBias));
+
+						float3 Position00 = GetTranslatedWorldPositionFromScreenUV(DownsampledScreenCoordToScreenUV(DownsampledScreenCoord00 + uint2(0, 0)), CornerDepths.x);
+						float3 Position10 = GetTranslatedWorldPositionFromScreenUV(DownsampledScreenCoordToScreenUV(DownsampledScreenCoord00 + uint2(1, 0)), CornerDepths.y);
+						float3 Position01 = GetTranslatedWorldPositionFromScreenUV(DownsampledScreenCoordToScreenUV(DownsampledScreenCoord00 + uint2(0, 1)), CornerDepths.z);
+						float3 Position11 = GetTranslatedWorldPositionFromScreenUV(DownsampledScreenCoordToScreenUV(DownsampledScreenCoord00 + uint2(1, 1)), CornerDepths.w);
+
+						float4 PlaneDistances;
+						PlaneDistances.x = abs(dot(float4(Position00, -1), ScenePlane));
+						PlaneDistances.y = abs(dot(float4(Position10, -1), ScenePlane));
+						PlaneDistances.z = abs(dot(float4(Position01, -1), ScenePlane));
+						PlaneDistances.w = abs(dot(float4(Position11, -1), ScenePlane));
+
+						float4 RelativeDepthDifference = PlaneDistances / Material.Depth;
+
+						DepthWeights = select(CornerDepths > 0.0f, exp2(-10000.0f * (RelativeDepthDifference * RelativeDepthDifference)), 0.0f);
+					}
+					#else
+					{
+						float4 DepthDifference = abs(CornerDepths - Material.Depth.xxxx);
+						float4 RelativeDepthDifference = DepthDifference / Material.Depth;
+
+						DepthWeights = select(CornerDepths > 0.0f, exp2(-100.0f * (RelativeDepthDifference * RelativeDepthDifference)), 0.0f);
+					}
+					#endif
+
+					InterpolationWeights *= DepthWeights;
+
+					// Skip out of view samples
+					InterpolationWeights.x = IsValidDownsampledCoord(DownsampledScreenCoord00.xy + uint2(0, 0)) ? InterpolationWeights.x : 0.0f;
+					InterpolationWeights.y = IsValidDownsampledCoord(DownsampledScreenCoord00.xy + uint2(1, 0)) ? InterpolationWeights.y : 0.0f;
+					InterpolationWeights.z = IsValidDownsampledCoord(DownsampledScreenCoord00.xy + uint2(0, 1)) ? InterpolationWeights.z : 0.0f;
+					InterpolationWeights.w = IsValidDownsampledCoord(DownsampledScreenCoord00.xy + uint2(1, 1)) ? InterpolationWeights.w : 0.0f;
+
+					// Renormalize
+					float Epsilon = 0.001f;
+					InterpolationWeights /= max(dot(InterpolationWeights, 1), Epsilon);
+					DownsampledScreenWeights = InterpolationWeights;
+				}
+
+				uint2 StochasticBilinearOffset = 0;
+
+				// Stochastic sample interpolation
+				{
+					float RandomScalar = BlueNoiseScalar(ScreenCoord, MegaLightsStateFrameIndex);
+					if (RandomScalar < DownsampledScreenWeights.x)
+					{
+						StochasticBilinearOffset = uint2(0, 0);
+					}
+					else if (RandomScalar < DownsampledScreenWeights.x + DownsampledScreenWeights.y)
+					{
+						StochasticBilinearOffset = uint2(1, 0);
+					}
+					else if (RandomScalar < DownsampledScreenWeights.x + DownsampledScreenWeights.y + DownsampledScreenWeights.z)
+					{
+						StochasticBilinearOffset = uint2(0, 1);
+					}
+					else
+					{
+						StochasticBilinearOffset = uint2(1, 1);
+					}
+				}
+
+				#if DEBUG_MODE
+				if (bDebug)
+				{
+					Print(Context, TEXT("ShadeSamples"), FontTitle);
+					Newline(Context);
+					Print(Context, TEXT("ScreenCoord         : "));
+					Print(Context, ScreenCoord, FontValue);
+					Newline(Context);
+					Print(Context, TEXT("DownsampledWeights  : "));
+					Print(Context, DownsampledScreenWeights, FontValue);
+					Newline(Context);
+					Print(Context, TEXT("LightId    | Weight  | Diffuse  | Specular"), FontSilver); 
+				}
+				#endif
+
+				int2 DownsampledScreenCoord = (int2(ScreenCoord) - 1) / DOWNSAMPLE_FACTOR + StochasticBilinearOffset;
+				DownsampledScreenCoord = clamp(DownsampledScreenCoord, int2(DownsampledViewMin), int2(DownsampledViewMin) + int2(DownsampledViewSize) - 1);
+
+				// Load samples into registers
+				uint PackedLightSamples[NUM_SAMPLES_PER_PIXEL_1D];
+				for (uint SampleIndex = 0; SampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++SampleIndex)
+				{
+					uint2 LightSampleCoord = DownsampledScreenCoord * uint2(NUM_SAMPLES_PER_PIXEL_2D_X, NUM_SAMPLES_PER_PIXEL_2D_Y) + uint2(SampleIndex % NUM_SAMPLES_PER_PIXEL_2D_X, SampleIndex / NUM_SAMPLES_PER_PIXEL_2D_X);				
+					PackedLightSamples[SampleIndex] = LightSamples[LightSampleCoord];
+				}
+
+				float MissWeightRatioSum = 0.0f;
+				uint NextLocalLightIndex = MAX_LOCAL_LIGHT_INDEX;
+				FindNextLocalLightIndex(PackedLightSamples, NextLocalLightIndex, MissWeightRatioSum);
+				WeightRatioSum -= MissWeightRatioSum;
+
+				while (NextLocalLightIndex < MAX_LOCAL_LIGHT_INDEX)
+				{
+					const uint LocalLightIndex = WaveActiveMin(NextLocalLightIndex);
+					if (LocalLightIndex == NextLocalLightIndex)
+					{
+						NextLocalLightIndex = MAX_LOCAL_LIGHT_INDEX;
+						float SampleWeight = 0.0f;
+						AccumulateLightSample(PackedLightSamples, LocalLightIndex, NextLocalLightIndex, SampleWeight, WeightRatioSum);
+
+						const FLocalLightData LocalLightData = GetLocalLightDataNonStereo(LocalLightIndex);
+						FDeferredLightData LightData = ConvertToDeferredLight(LocalLightData);
+
+						if (UseLightFunctionAtlas == 0)
+						{
+							LightData.LightFunctionAtlasLightIndex = 0;
+						}
+
+						if (UseIESProfiles == 0)
+						{
+							LightData.IESAtlasIndex = -1;
+						}
+						
+						if (!IsRectLightTileType(TILE_TYPE))
+						{
+							LightData.bRectLight = false;
+						}
+
+						if (!IsTexturedLightTileType(TILE_TYPE))
+						{
+							LightData.RectLightData.AtlasData.AtlasMaxLevel = MAX_RECT_ATLAS_MIP;
+						}
+						
+						if (SampleWeight > 0.01f && LightData.IESAtlasIndex >= 0)
+						{
+							SampleWeight *= ComputeLightProfileMultiplier(TranslatedWorldPosition, LightData.TranslatedWorldPosition, -LightData.Direction, LightData.Tangent, LightData.IESAtlasIndex);
+						}
+
+						#if DEBUG_MODE
+						if (bDebug)
+						{
+							Newline(Context);
+							Print(Context, LocalLightData.LightSceneId, Select(LocalLightData.LightSceneId == DebugLightId, FontSelected, FontValue));
+							Print(Context, SampleWeight, FontValue);
+						}
+						#endif
+
+						if (SampleWeight > 0.0f)
+						{
+							float4 LightAttenuation = 1.0f;
+							float Dither = 0.5f;
+							float SurfaceShadow = 1;
+							float AmbientOcclusion = ScreenSpaceAO;
+							LightData.ShadowedBits = 0;
+
+							FDeferredLightingSplit SplitLighting = GetMegaLightsSplitLighting(
+								TranslatedWorldPosition, CameraVector, Material, AmbientOcclusion, 
+								LightData, LightAttenuation, Dither, ScreenCoord, 
+								SurfaceShadow);
+
+							DiffuseLighting += SplitLighting.DiffuseLighting.xyz * SampleWeight;
+							SpecularLighting += SplitLighting.SpecularLighting.xyz * SampleWeight;
+
+							#if DEBUG_MODE 
+							if (bDebug)
+							{
+								Print(Context, SplitLighting.DiffuseLighting.xyz, FontValue);
+								Print(Context, SplitLighting.SpecularLighting.xyz, FontValue);
+							}
+							#endif
+						}
+					}
+				}
+
+				// Apply pre-exposure
+				DiffuseLighting *= View.PreExposure;
+				SpecularLighting *= View.PreExposure;
+
+				DemodulateLighting(Material, TranslatedWorldPosition, DiffuseLighting, SpecularLighting);
+			}
+
+			// Normalize weight by a number of samples taken
+			WeightRatioSum /= float(NUM_SAMPLES_PER_PIXEL_1D * NUM_SAMPLES_PER_PIXEL_1D);
+
+			#if DEBUG_MODE
+			if (bDebug)
+			{
+				Newline(Context);
+				Print(Context, TEXT("Diffuse             : ")); 
+				Print(Context, DiffuseLighting, FontValue);
+				Newline(Context);
+				Print(Context, TEXT("Specular            : ")); 
+				Print(Context, SpecularLighting, FontValue);
+				Newline(Context);
+				Print(Context, TEXT("WeightRatioSum      : ")); 
+				Print(Context, WeightRatioSum, FontValue);
+			}
+			#endif
+
+			RWResolvedDiffuseLighting[ScreenCoord] = DiffuseLighting;
+			RWResolvedSpecularLighting[ScreenCoord] = SpecularLighting;
+			RWShadingConfidence[ScreenCoord] = UseShadingConfidence != 0 ? WeightRatioSum : 0.0f;
+		}
+	}
+}
+
+/**
+ * Clear some data for empty tiles, which won't be processed by ShadeLightSamplesCS
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ClearResolvedLightingCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TileIndex = GroupId.x;
+	if (TileIndex < TileAllocator[TILE_MODE_EMPTY])
+	{
+		uint2 TileCoord = UnpackTile(TileData[TileIndex + TILE_MODE_EMPTY * TileDataStride]);
+		uint2 ScreenCoord = TileCoord * TILE_SIZE + GroupThreadId.xy;
+
+		if (all(ScreenCoord < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+		{
+			RWResolvedDiffuseLighting[ScreenCoord] = INVALID_LIGHTING;
+			RWResolvedSpecularLighting[ScreenCoord] = INVALID_LIGHTING;
+		}
+	}
+}

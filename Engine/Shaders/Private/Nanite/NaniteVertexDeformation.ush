@@ -1,0 +1,266 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../SplineMeshCommon.ush"
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+#include "NaniteSceneCommon.ush"
+
+// Represents vertex data for a Nanite mesh in local space
+struct FNaniteLocalVertex
+{
+	// Index of the vertex in the cluster
+	uint VertIndex;
+	// Decoded vertex position
+	float3 Position;
+	// Decoded vertex attribute data
+	FNaniteRawAttributeData RawAttributeData;
+};
+
+// Decodes vertex data for the specified vertex in a cluster (and potentially deforms it into final local space)
+FNaniteLocalVertex FetchLocalNaniteVertex(FCluster Cluster, uint VertIndex, uint CompileTimeMaxTexCoords)
+{
+	FNaniteLocalVertex Output = (FNaniteLocalVertex)0;
+
+	Output.VertIndex = VertIndex;
+	Output.Position = DecodePosition(VertIndex, Cluster);
+	Output.RawAttributeData = GetRawAttributeData(Cluster, VertIndex, CompileTimeMaxTexCoords);
+
+	return Output;
+}
+
+void FetchLocalNaniteTriangle(FCluster Cluster, uint3 VertIndexes, uint CompileTimeMaxTexCoords, inout FNaniteLocalVertex OutVerts[3])
+{
+	const float3 Positions[3] = 
+	{
+		DecodePosition(VertIndexes.x, Cluster),
+		DecodePosition(VertIndexes.y, Cluster),
+		DecodePosition(VertIndexes.z, Cluster)
+	};
+
+	FNaniteRawAttributeData RawAttributeData[3];
+	GetRawAttributeData3(RawAttributeData, Cluster, VertIndexes, CompileTimeMaxTexCoords);
+
+	UNROLL_N(3)
+	for (uint i = 0; i < 3; ++i)
+	{
+		OutVerts[i].VertIndex			= VertIndexes[i];
+		OutVerts[i].Position			= Positions[i];
+		OutVerts[i].RawAttributeData	= RawAttributeData[i];
+	}
+}
+
+
+// Represents vertex data for a Nanite mesh in local space, post-deformation (when applicable)
+struct FNanitePostDeformVertex
+{
+	// Index of the vertex in the cluster
+	uint VertIndex;
+
+	// Post-deformed position of the vertex
+	float3 Position;
+
+	// Decoded vertex position (BEFORE deformation)
+	float3 PointLocal;
+
+	// Vertex normal (BEFORE deformation)
+	float3 PreSkinnedNormal;
+
+	// Post-deformed tangent basis of the vertex
+	FNaniteTangentBasis TangentBasis;
+
+	// Normalized distance along the spline (spline meshes only)
+	half SplineDist;
+
+	// Decoded vertex attribute data
+	FNaniteRawAttributeData RawAttributeData;
+};
+
+FNanitePostDeformVertex DeformLocalNaniteVertex(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FCluster Cluster, FNaniteLocalVertex Input)
+{
+	FNanitePostDeformVertex Output;
+	Output.VertIndex			= Input.VertIndex;
+	Output.TangentBasis			= MakeTangentBasis(Input.RawAttributeData);
+	Output.SplineDist			= 0.0f;
+	Output.RawAttributeData		= Input.RawAttributeData;
+	Output.PointLocal			= Input.Position;
+	Output.Position				= Input.Position;
+	Output.PreSkinnedNormal		= Output.TangentBasis.TangentZ;
+
+#if USE_SKINNING
+	BRANCH
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0 && Cluster.bSkinning)
+	{
+		FNaniteSkinningHeader SkinningHeader = LoadNaniteSkinningHeader(InstanceData.PrimitiveId);
+		FBoneInfluenceHeader BoneInfluenceHeader = GetBoneInfluenceHeader(Cluster);
+
+		float3 SkinnedPosition = float3(0.0f, 0.0f, 0.0f);
+		float3 SkinnedNormal = float3(0.0f, 0.0f, 0.0f);
+		float3 SkinnedTangent = float3(0.0f, 0.0f, 0.0f);
+
+		LOOP
+		for (uint InfluenceIndex = 0; InfluenceIndex < BoneInfluenceHeader.NumVertexBoneInfluences; ++InfluenceIndex)
+		{
+			uint BoneIndex = 0;
+			float BoneWeight = 0.0f;
+			DecodeVertexBoneInfluence(BoneInfluenceHeader, Input.VertIndex, InfluenceIndex, BoneIndex, BoneWeight);
+
+			const float4x3 BoneTransform = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + InstanceData.SkinningData + BoneIndex);
+			SkinnedPosition	+= mul(float4(Input.Position, 1.0f), BoneTransform) * BoneWeight;
+			SkinnedNormal	+= mul(Output.TangentBasis.TangentZ, (float3x3)BoneTransform) * BoneWeight;
+			SkinnedTangent	+= mul(Output.TangentBasis.TangentXAndSign.xyz, (float3x3)BoneTransform) * BoneWeight;
+		}
+
+		Output.TangentBasis.TangentZ = SkinnedNormal;
+		Output.TangentBasis.TangentXAndSign.xyz = SkinnedTangent;
+
+	#if 0
+		Output.TangentBasis.RecalculateTangentX();
+	#endif
+
+		Output.Position = SkinnedPosition;
+	}
+#endif
+
+#if USE_SPLINEDEFORM
+	BRANCH
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SPLINE_MESH) != 0 &&
+		(InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_PAYLOAD_EXTENSION) != 0)
+	{
+		// Deform the local position and tangent basis along the spline
+		// NOTE: Storing off the spline distance for use later when calculating tangent frame.
+		FSplineMeshShaderParams SplineMeshParams = SplineMeshLoadParamsFromInstancePayload(InstanceData);
+		Output.SplineDist = SplineMeshDeformLocalPosNormalTangent(
+			SplineMeshParams,
+			Output.Position,
+			Output.TangentBasis.TangentZ,
+			Output.TangentBasis.TangentXAndSign.xyz
+		);
+	}
+#endif
+
+	return Output;
+}
+
+FNanitePostDeformVertex FetchAndDeformLocalNaniteVertex(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FCluster Cluster, uint VertIndex, uint CompileTimeMaxTexCoords)
+{
+	return DeformLocalNaniteVertex(PrimitiveData, InstanceData, Cluster, FetchLocalNaniteVertex(Cluster, VertIndex, CompileTimeMaxTexCoords));
+}
+
+void FetchAndDeformLocalNaniteTriangle(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FCluster Cluster, uint3 VertIndexes, uint CompileTimeMaxTexCoords, inout FNanitePostDeformVertex OutVerts[3])
+{
+	FNaniteLocalVertex InVerts[3];
+	FetchLocalNaniteTriangle(Cluster, VertIndexes, CompileTimeMaxTexCoords, InVerts);
+
+	UNROLL_N(3)
+	for(uint i = 0; i < 3; ++i)
+	{
+		OutVerts[i] = DeformLocalNaniteVertex(PrimitiveData, InstanceData, Cluster, InVerts[i]);
+	}
+}
+
+ENCODED_VELOCITY_TYPE CalculateNaniteVelocity(FNaniteView NaniteView, FInstanceSceneData InstanceData, FCluster Cluster, float4 SvPosition, uint TriIndex, uint PrimitiveFlags, bool bWPOEnabled)
+{
+#if VELOCITY_EXPORT
+	FInstanceDynamicData InstanceDynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData);
+
+	const float4 ScreenPos = SvPositionToScreenPosition(SvPosition);
+
+	float4 ScreenPosPrev;
+
+	const bool bOutputVelocity = !bWPOEnabled && (PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_OUTPUT_VELOCITY) != 0;
+	if (!bOutputVelocity)
+	{
+		return (ENCODED_VELOCITY_TYPE)0;
+	}
+
+#if USE_SKINNING
+	BRANCH
+	if ((PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0 && Cluster.bSkinning)
+	{
+		FNaniteSkinningHeader SkinningHeader = LoadNaniteSkinningHeader(InstanceData.PrimitiveId);
+		FBoneInfluenceHeader BoneInfluenceHeader = GetBoneInfluenceHeader(Cluster);
+
+		const uint3 TriIndices = DecodeTriangleIndices(Cluster, TriIndex);
+
+		float3 PointLocal[3];
+		PointLocal[0] = DecodePosition(TriIndices[0], Cluster);
+		PointLocal[1] = DecodePosition(TriIndices[1], Cluster);
+		PointLocal[2] = DecodePosition(TriIndices[2], Cluster);
+
+		float3 CurrentPosition[3];
+		CurrentPosition[0] = float3(0.0f, 0.0f, 0.0f);
+		CurrentPosition[1] = float3(0.0f, 0.0f, 0.0f);
+		CurrentPosition[2] = float3(0.0f, 0.0f, 0.0f);
+
+		float3 PreviousPosition[3];
+		PreviousPosition[0] = float3(0.0f, 0.0f, 0.0f);
+		PreviousPosition[1] = float3(0.0f, 0.0f, 0.0f);
+		PreviousPosition[2] = float3(0.0f, 0.0f, 0.0f);
+
+		LOOP
+		for (uint InfluenceIndex = 0; InfluenceIndex < BoneInfluenceHeader.NumVertexBoneInfluences; ++InfluenceIndex)
+		{
+			uint BoneIndex0 = 0;
+			float BoneWeight0 = 0.0f;
+			DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.x, InfluenceIndex, BoneIndex0, BoneWeight0);
+
+			uint BoneIndex1 = 0;
+			float BoneWeight1 = 0.0f;
+			DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.y, InfluenceIndex, BoneIndex1, BoneWeight1);
+
+			uint BoneIndex2 = 0;
+			float BoneWeight2 = 0.0f;
+			DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.z, InfluenceIndex, BoneIndex2, BoneWeight2);
+
+			float4x3 CurrentBoneTransform[3];
+			CurrentBoneTransform[0] = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + InstanceData.SkinningData + BoneIndex0);
+			CurrentBoneTransform[1] = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + InstanceData.SkinningData + BoneIndex1);
+			CurrentBoneTransform[2] = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + InstanceData.SkinningData + BoneIndex2);
+
+			float4x3 PreviousBoneTransform[3];
+			PreviousBoneTransform[0] = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + SkinningHeader.MaxTransformCount + InstanceData.SkinningData + BoneIndex0);
+			PreviousBoneTransform[1] = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + SkinningHeader.MaxTransformCount + InstanceData.SkinningData + BoneIndex1);
+			PreviousBoneTransform[2] = LoadNaniteBoneTransform(SkinningHeader.TransformBufferOffset + SkinningHeader.MaxTransformCount + InstanceData.SkinningData + BoneIndex2);
+
+			CurrentPosition[0] += mul(float4(PointLocal[0], 1.0f), CurrentBoneTransform[0]) * BoneWeight0;
+			CurrentPosition[1] += mul(float4(PointLocal[1], 1.0f), CurrentBoneTransform[1]) * BoneWeight1;
+			CurrentPosition[2] += mul(float4(PointLocal[2], 1.0f), CurrentBoneTransform[2]) * BoneWeight2;
+
+			PreviousPosition[0] += mul(float4(PointLocal[0], 1.0f), PreviousBoneTransform[0]) * BoneWeight0;
+			PreviousPosition[1] += mul(float4(PointLocal[1], 1.0f), PreviousBoneTransform[1]) * BoneWeight1;
+			PreviousPosition[2] += mul(float4(PointLocal[2], 1.0f), PreviousBoneTransform[2]) * BoneWeight2;
+		}
+
+		const float3 PointWorld0 = mul(float4(CurrentPosition[0], 1), InstanceDynamicData.LocalToTranslatedWorld).xyz;
+		const float3 PointWorld1 = mul(float4(CurrentPosition[1], 1), InstanceDynamicData.LocalToTranslatedWorld).xyz;
+		const float3 PointWorld2 = mul(float4(CurrentPosition[2], 1), InstanceDynamicData.LocalToTranslatedWorld).xyz;
+
+		const float4 PointClip0 = mul(float4(PointWorld0, 1), NaniteView.TranslatedWorldToClip);
+		const float4 PointClip1 = mul(float4(PointWorld1, 1), NaniteView.TranslatedWorldToClip);
+		const float4 PointClip2 = mul(float4(PointWorld2, 1), NaniteView.TranslatedWorldToClip);
+
+		// Calculate perspective correct barycentric coordinates with screen derivatives
+		const float2 PixelClip = (SvPosition.xy - NaniteView.ViewRect.xy) * NaniteView.ViewSizeAndInvSize.zw * float2(2, -2) + float2(-1, 1);
+		const FBarycentrics Barycentrics = CalculateTriangleBarycentrics(PixelClip, PointClip0, PointClip1, PointClip2, NaniteView.ViewSizeAndInvSize.zw);
+
+		const float3 PrevPointLocal = Lerp(PreviousPosition[0], PreviousPosition[1], PreviousPosition[2], Barycentrics).Value;
+		float3 PrevPointWorld = mul(float4(PrevPointLocal.xyz, 1), InstanceDynamicData.PrevLocalToTranslatedWorld).xyz;
+		ScreenPosPrev = mul(float4(PrevPointWorld, 1), NaniteView.PrevTranslatedWorldToClip);
+	}
+	else
+#endif
+	{
+		const FDFVector3 WorldPos = SvPositionToWorld(SvPosition);
+		const float3 LocalPos = DFMultiplyDemote(WorldPos, InstanceData.WorldToLocal);
+		const float3 WorldPosPrev = mul(float4(LocalPos, 1), InstanceDynamicData.PrevLocalToTranslatedWorld).xyz;
+		ScreenPosPrev = mul(float4(WorldPosPrev, 1), NaniteView.PrevTranslatedWorldToClip);
+	}
+
+	const float3 Velocity = Calculate3DVelocity(ScreenPos, ScreenPosPrev);
+	return EncodeVelocityToTexture(Velocity, (PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_HAS_PIXEL_ANIMATION) != 0);
+#else
+	return (ENCODED_VELOCITY_TYPE)0;
+#endif
+}

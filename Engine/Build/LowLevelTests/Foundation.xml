@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BuildGraph xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../Build/Graph/Schema.xsd" xmlns="http://www.epicgames.com/BuildGraph">
+  <Option Name="RunFoundationTests" DefaultValue="" Description="Run Foundation Tests" />
+  <Property Name="TestNames" Value="$(TestNames);Foundation" />
+  <Extend Name="RunAllTests">
+    <Expand Name="DeployAndTest" Platform="Win64" TestName="Foundation" ShortName="Foundation" TargetName="FoundationTests" BinaryRelativePath="Engine\Binaries" ReportType="xml" ExtraCompilationArgs="-allmodules" />
+    <Expand Name="DeployAndTest" Platform="Linux" TestName="Foundation" ShortName="Foundation" TargetName="FoundationTests" BinaryRelativePath="Engine\Binaries" ReportType="xml" Tags="~[.]~[Slow]" ExtraCompilationArgs="-allmodules" />
+    <Expand Name="DeployAndTest" Platform="Mac" TestName="Foundation" ShortName="Foundation" TargetName="FoundationTests" BinaryRelativePath="Engine\Binaries" ReportType="xml" ExtraCompilationArgs="-allmodules" />
+    <Expand Name="DeployAndTest" Platform="Android" TestName="Foundation" ShortName="Foundation" TargetName="FoundationTests" BinaryRelativePath="Engine\Binaries" ReportType="xml" Tags="~[Perf]~[Slow]~[AndroidSkip]" ExtraCompilationArgs="-allmodules -architectures=arm64" />
+    <Expand Name="DeployAndTest" Platform="IOS" TestName="Foundation" ShortName="Foundation" TargetName="FoundationTests" BinaryRelativePath="Engine\Binaries" ReportType="xml" ExtraCompilationArgs="-allmodules" RunUnsupported="True" />
+  </Extend>
+</BuildGraph>

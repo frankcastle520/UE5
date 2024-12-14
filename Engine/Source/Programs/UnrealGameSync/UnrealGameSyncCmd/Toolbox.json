@@ -1,0 +1,14 @@
+{
+    "installCommand": {
+        "fileName": "ugs.exe",
+        "arguments": [
+            "install"
+        ]
+    },
+    "uninstallCommand": {
+        "fileName": "ugs.exe",
+        "arguments": [
+            "uninstall"
+        ]
+    }
+}

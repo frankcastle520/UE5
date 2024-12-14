@@ -1,0 +1,96 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Float R11G11B10 max
+#define INVALID_LIGHTING float3(65024.0f, 65024.0f, 64512.0f)
+
+bool IsLightingValid(float3 V)
+{
+	return !all(V == INVALID_LIGHTING);
+}
+
+float3 LumenRGBToYCoCg(float3 RGB)
+{
+	float Y  = dot(RGB, float3( 1, 2,  1));
+	float Co = dot(RGB, float3( 2, 0, -2));
+	float Cg = dot(RGB, float3(-1, 2, -1));
+	
+	float3 YCoCg = float3(Y, Co, Cg);
+	return YCoCg;
+}
+
+float3 LumenYCoCgToRGB(float3 YCoCg)
+{
+	float Y  = YCoCg.x * 0.25f;
+	float Co = YCoCg.y * 0.25f;
+	float Cg = YCoCg.z * 0.25f;
+
+	float R = Y + Co - Cg;
+	float G = Y + Cg;
+	float B = Y - Co - Cg;
+
+	float3 RGB = float3(R, G, B);
+	return RGB;
+}
+
+// [Moving Frostbite to Physically Based Rendering 3.0]
+// Approximates factor in Lerp(N, R, factor) = dominant direction of a GGX lobe
+float GetSpecularDominantDirFactor(float Roughness)
+{
+	float S = saturate(1.0f - Roughness);
+	return S * (sqrt(S) + Roughness);
+}
+
+// [Moving Frostbite to Physically Based Rendering 3.0]
+float GetSpecularLobeHalfAngle(float Roughness)
+{
+	float E = 0.75f; // Percentage of preserved energy
+	float LobeHalfAngle = AtanFast((Pow2(Roughness) * E) / (1.0f - E));
+	return LobeHalfAngle;
+}
+
+float3 RGBToDenoiserSpace(float3 V)
+{
+	if (IsLightingValid(V))
+	{
+		// Compress range in order to suppress fireflies and reduce noise
+		// Adds a bit of bias to temporal and spatial filtering, but mostly in spots which can't be resolved anyway
+		V = sqrt(V);
+	}
+
+	return V;
+}
+
+float4 RGBAToDenoiserSpace(float4 V)
+{
+	V.xyz = RGBToDenoiserSpace(V.xyz);
+	return V;
+}
+
+float3 DenoiserSpaceToRGB(float3 V)
+{
+	if (IsLightingValid(V))
+	{
+		V = Pow2(V);
+	}
+
+	return V;
+}
+
+float PackNumFramesAccumulated(float X)
+{
+	// Assume UInt8 quantization
+	return X / 32.0f + 0.5f / 255.0f;
+}
+
+float UnpackNumFramesAccumulated(float X)
+{
+	return X * 32.0f;
+}
+
+uint GetMaxFramesAccumulated(uint MaxFrames, float Roughness)
+{
+	// Speedup accumulation for mirror reflections in order to reduce ghosting and other artifacts
+	// Mirror reflections don't need many samples to converge and can be mostly handled by TAA
+	MaxFrames = lerp(2, MaxFrames, saturate(Roughness / 0.05f));
+	return MaxFrames;
+}

@@ -1,0 +1,50 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#define DefineStatelessDistributionSampler(HLSLTYPE, NAMETYPE) \
+	struct FStatelessDistributionSampler##NAMETYPE \
+	{ \
+		void Init(uint RandomSeedOffset, FNiagaraStatelessBuiltDistributionType InBuildDistribution) \
+		{ \
+			BuildDistribution = InBuildDistribution; \
+			RandomOffset = 0.0f; \
+			if ( FNiagaraStatelessBuiltDistribution::IsRandom(BuildDistribution) != 0) \
+			{ \
+				RandomOffset = Random##NAMETYPE##(RandomSeedOffset); \
+			} \
+		} \
+		\
+		bool IsValid() { return FNiagaraStatelessBuiltDistribution::IsValid(BuildDistribution); } \
+		\
+		HLSLTYPE GetValue(float Time) \
+		{ \
+			const uint DataOffset = FNiagaraStatelessBuiltDistribution::GetDataOffset(BuildDistribution); \
+			if (FNiagaraStatelessBuiltDistribution::IsBinding(BuildDistribution)) \
+			{ \
+				return GetParameterBuffer##NAMETYPE##(DataOffset, 0); \
+			} \
+			else if (FNiagaraStatelessBuiltDistribution::IsRandom(BuildDistribution)) \
+			{ \
+				const HLSLTYPE Value0 = GetStatic##NAMETYPE##(DataOffset, 0); \
+				const HLSLTYPE Value1 = GetStatic##NAMETYPE##(DataOffset, 1); \
+				return StatelessLerp(Value0, Value1, RandomOffset, FNiagaraStatelessBuiltDistribution::IsUniform(BuildDistribution)); \
+			} \
+			else \
+			{ \
+				const float Offset = FNiagaraStatelessBuiltDistribution::ConvertTimeToLookup(BuildDistribution, Time); \
+				const HLSLTYPE Value0 = GetStatic##NAMETYPE##(DataOffset, floor(Offset)); \
+				const HLSLTYPE Value1 = GetStatic##NAMETYPE##(DataOffset, ceil(Offset)); \
+				return lerp(Value0, Value1, frac(Offset)); \
+			} \
+		} \
+		\
+		FNiagaraStatelessBuiltDistributionType		BuildDistribution; \
+		HLSLTYPE									RandomOffset; \
+	}
+
+DefineStatelessDistributionSampler(float,  Float);
+DefineStatelessDistributionSampler(float2, Float2);
+DefineStatelessDistributionSampler(float3, Float3);
+DefineStatelessDistributionSampler(float4, Float4);
+
+#undef DefineStatelessDistributionSampler

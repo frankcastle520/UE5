@@ -1,0 +1,14 @@
+{
+    "installCommand": {
+        "fileName": "p4vutils.exe",
+        "arguments": [
+            "install"
+        ]
+    },
+    "uninstallCommand": {
+        "fileName": "p4vutils.exe",
+        "arguments": [
+            "uninstall"
+        ]
+    }
+}

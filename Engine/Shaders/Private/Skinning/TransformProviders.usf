@@ -1,0 +1,51 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneData.ush"
+#include "/Engine/Private/BoneTransform.ush"
+
+struct FPrimitiveTransforms
+{
+	float3x4 Current;
+	float3x4 Previous;
+};
+
+struct FTransformBlockHeader
+{
+	uint BlockLocalIndex;
+	uint BlockTransformCount;
+	uint BlockTransformOffset;
+};
+
+RWByteAddressBuffer TransformBuffer;
+StructuredBuffer<FTransformBlockHeader> HeaderBuffer;
+
+[numthreads(TRANSFORMS_PER_GROUP, 1, 1)]
+void RefPoseProviderCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint GlobalBlockIndex		= GroupId.x;
+	const uint LocalTransformIndex	= GroupIndex;
+
+	const FTransformBlockHeader BlockHeader = HeaderBuffer[GlobalBlockIndex];
+	if (LocalTransformIndex < BlockHeader.BlockTransformCount)
+	{
+		const uint TransformOffset = BlockHeader.BlockTransformOffset + (LocalTransformIndex * (uint)sizeof(FPrimitiveTransforms));
+
+		float3x4 Identity;
+		Identity[0] = float4(1.0f, 0.0f, 0.0f, 0.0f);
+		Identity[1] = float4(0.0f, 1.0f, 0.0f, 0.0f);
+		Identity[2] = float4(0.0f, 0.0f, 1.0f, 0.0f);
+
+		// Every primitive has 2 transforms (current 3x4 and previous 3x4 packed together)
+		FPrimitiveTransforms Transforms;
+		Transforms.Current  = Identity;
+		Transforms.Previous = Identity;
+
+	#if COMPILER_SUPPORTS_TYPEDSTORE
+		TransformBuffer.TypedStore<FPrimitiveTransforms>(TransformOffset, Transforms);
+	#else
+		TransformBuffer.Store<FPrimitiveTransforms>(TransformOffset, Transforms);
+	#endif
+	}
+}

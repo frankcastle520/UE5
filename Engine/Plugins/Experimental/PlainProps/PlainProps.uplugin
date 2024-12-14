@@ -1,0 +1,20 @@
+{
+	"FileVersion" : 3,
+	"FriendlyName" : "PlainProps",
+	"Description" : "New Serialization Stack Prototype",
+	"Category": "Experimental",
+	"CreatedBy" : "Epic Games, Inc.",
+	"CreatedByURL" : "https://epicgames.com",
+	"EnabledByDefault" : false,
+	"IsExperimentalVersion": true,
+	"SupportedTargetPlatforms": [
+		"Win64"
+	],
+	"Modules": [
+		{
+			"Name" : "PlainProps",
+			"Type" : "Runtime",
+			"PlatformAllowList": [ "Win64" ]
+		}
+	]
+}

@@ -1,0 +1,248 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// When loading SSS checkerboard pixel, do not adjust DiffuseColor/SpecularColor to preserve specular and diffuse lighting values for each pixel
+#define ALLOW_SSS_MATERIAL_OVERRIDE 0
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "MegaLights.ush"
+#include "MegaLightsVolume.ush"
+#include "../Lumen/LumenReflectionDenoiserCommon.ush"
+
+int VolumeDebugSliceIndex;
+float3 VolumeFrameJitterOffset;
+float VolumeInverseSquaredLightDistanceBiasScale;
+uint3 VolumeSampleViewSize;
+uint3 DownsampledVolumeViewSize;
+uint3 NumSamplesPerVoxel;
+Texture3D<uint> VolumeLightSamples;
+
+RWTexture3D<float3> RWVolumeResolvedLighting;
+
+void LoadPackedLightSamples(inout uint PackedLightSamples[NUM_SAMPLES_PER_VOXEL_1D], int3 DownsampledVolumeCoord)
+{
+	DownsampledVolumeCoord = clamp(DownsampledVolumeCoord, int3(0, 0, 0), int3(DownsampledVolumeViewSize - 1));
+
+	for (uint SampleIndex = 0; SampleIndex < NUM_SAMPLES_PER_VOXEL_1D; ++SampleIndex)
+	{
+		uint3 LightSampleCoord = DownsampledVolumeCoord * uint3(NUM_SAMPLES_PER_VOXEL_3D_X, NUM_SAMPLES_PER_VOXEL_3D_Y, NUM_SAMPLES_PER_VOXEL_3D_Z) 
+			+ uint3(SampleIndex % NUM_SAMPLES_PER_VOXEL_3D_X, SampleIndex / NUM_SAMPLES_PER_VOXEL_3D_X, 0);
+
+		PackedLightSamples[SampleIndex] = VolumeLightSamples[LightSampleCoord];
+	}
+}
+
+void AccumulateLightSample(uint PackedLightSamples[NUM_SAMPLES_PER_VOXEL_1D], inout uint NextLocalLightIndex)
+{
+	for (uint SampleIndex = 0; SampleIndex < NUM_SAMPLES_PER_VOXEL_1D; ++SampleIndex)
+	{
+		FLightSample LightSample = UnpackLightSample(PackedLightSamples[SampleIndex]);
+		if (LightSample.bVisible)
+		{
+			NextLocalLightIndex = min(NextLocalLightIndex, LightSample.LocalLightIndex);
+		}
+	}
+}
+
+void AccumulateLightSample(uint PackedLightSamples[NUM_SAMPLES_PER_VOXEL_1D], uint LocalLightIndex, float UpsampleWeight, inout uint NextLocalLightIndex, inout float SampleWeightSum)
+{
+	for (uint SampleIndex = 0; SampleIndex < NUM_SAMPLES_PER_VOXEL_1D; ++SampleIndex)
+	{
+		FLightSample LightSample = UnpackLightSample(PackedLightSamples[SampleIndex]);
+		if (LightSample.bVisible)
+		{
+			if (LightSample.LocalLightIndex == LocalLightIndex)
+			{
+				SampleWeightSum += LightSample.Weight * UpsampleWeight;
+			}
+
+			if (LightSample.LocalLightIndex > LocalLightIndex)
+			{
+				NextLocalLightIndex = min(NextLocalLightIndex, LightSample.LocalLightIndex);
+			}
+		}
+	}
+}
+
+uint3 GetStochasticOffset(float RandomScalar, float4 InterpolationWeights0, float4 InterpolationWeights1)
+{
+	uint3 StochasticTrilinearOffset = 0;
+	if (RandomScalar < InterpolationWeights0.x)
+	{
+		StochasticTrilinearOffset = uint3(0, 0, 0);
+	}
+	else if (RandomScalar < InterpolationWeights0.x + InterpolationWeights0.y)
+	{
+		StochasticTrilinearOffset = uint3(1, 0, 0);
+	}
+	else if (RandomScalar < InterpolationWeights0.x + InterpolationWeights0.y + InterpolationWeights0.z)
+	{
+		StochasticTrilinearOffset = uint3(0, 1, 0);
+	}
+	else if (RandomScalar < InterpolationWeights0.x + InterpolationWeights0.y + InterpolationWeights0.z + InterpolationWeights0.w)
+	{
+		StochasticTrilinearOffset = uint3(1, 1, 0);
+	}
+	else if (RandomScalar < InterpolationWeights0.x + InterpolationWeights0.y + InterpolationWeights0.z + InterpolationWeights0.w + InterpolationWeights1.x)
+	{
+		StochasticTrilinearOffset = uint3(0, 0, 1);
+	}
+	else if (RandomScalar < InterpolationWeights0.x + InterpolationWeights0.y + InterpolationWeights0.z + InterpolationWeights0.w + InterpolationWeights1.x + InterpolationWeights1.y)
+	{
+		StochasticTrilinearOffset = uint3(1, 0, 1);
+	}
+	else if (RandomScalar < InterpolationWeights0.x + InterpolationWeights0.y + InterpolationWeights0.z + InterpolationWeights0.w + InterpolationWeights1.x + InterpolationWeights1.y + InterpolationWeights1.z)
+	{
+		StochasticTrilinearOffset = uint3(0, 1, 1);
+	}
+	else
+	{
+		StochasticTrilinearOffset = uint3(1, 1, 1);
+	}
+	return StochasticTrilinearOffset;
+}
+
+/**
+ * Upsample light samples and apply all lights per voxel
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void VolumeShadeLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint3 VolumeCoord = DispatchThreadId.xyz;
+	if (all(VolumeCoord < VolumeViewSize))
+	{
+		FDebug Debug;
+		#if DEBUG_MODE
+		{
+			int2 DebugScreenCoord = GetDebugScreenCoord();
+			Debug.bActive = all(VolumeCoord == int3(DebugScreenCoord >> MegaLightsVolumePixelSizeShift, VolumeDebugSliceIndex));
+			Debug.Context = InitShaderPrintContext(true, float2(0.5, 0.05));
+		}
+		#endif
+
+		float SceneDepth = 0.0f;
+		const float3 TranslatedWorldPosition = ComputeCellTranslatedWorldPosition(VolumeCoord, VolumeFrameJitterOffset, SceneDepth);
+		const float3 CameraVector = normalize(TranslatedWorldPosition - View.TranslatedWorldCameraOrigin);
+
+		#if DEBUG_MODE
+		if (Debug.bActive)
+		{
+			Print(Debug.Context, TEXT("VolumeShadeLightSamples"));
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("Coord: "));
+			Print(Debug.Context, VolumeCoord);
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("TileCoord: "));
+			Print(Debug.Context, GroupId.xyz);
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("TWS: "));
+			Print(Debug.Context, TranslatedWorldPosition);
+			AddCrossTWS(Debug.Context, TranslatedWorldPosition, 5.0f, float4(0, 0, 1, 1));
+
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("LightId   | Weight    | Lighting"));
+		}
+		#endif
+
+		float SceneDepth2 = 0.0f;
+		float SceneDepth3 = 0.0f;
+		float CellRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(VolumeCoord + uint3(1, 1, 1), VolumeFrameJitterOffset, SceneDepth2));
+		float Cell2DRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(VolumeCoord + uint3(1, 1, 0), VolumeFrameJitterOffset, SceneDepth3));
+		float LightVolumetricSoftFadeDistance = LightSoftFading * Cell2DRadius;
+		// Bias the inverse squared light falloff based on voxel size to prevent aliasing near the light source
+		float DistanceBiasSqr = max(CellRadius * VolumeInverseSquaredLightDistanceBiasScale, 1);
+		DistanceBiasSqr *= DistanceBiasSqr;
+
+		int3 DownsampledVolumeCoord000 = int3(VolumeCoord - 1) / DOWNSAMPLE_FACTOR;
+		int3 VolumeCoordOffset = VolumeCoord - DownsampledVolumeCoord000 * 2;
+		int3 SampleOffset000 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(0, 0, 0)) + uint3(0, 0, 0) * 2 - VolumeCoordOffset;
+		int3 SampleOffset100 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(1, 0, 0)) + uint3(1, 0, 0) * 2 - VolumeCoordOffset;
+		int3 SampleOffset010 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(0, 1, 0)) + uint3(0, 1, 0) * 2 - VolumeCoordOffset;
+		int3 SampleOffset110 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(1, 1, 0)) + uint3(1, 1, 0) * 2 - VolumeCoordOffset;
+		int3 SampleOffset001 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(0, 0, 1)) + uint3(0, 0, 1) * 2 - VolumeCoordOffset;
+		int3 SampleOffset101 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(1, 0, 1)) + uint3(1, 0, 1) * 2 - VolumeCoordOffset;
+		int3 SampleOffset011 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(0, 1, 1)) + uint3(0, 1, 1) * 2 - VolumeCoordOffset;
+		int3 SampleOffset111 = GetSampleVoxelCoordJitter(DownsampledVolumeCoord000 + uint3(1, 1, 1)) + uint3(1, 1, 1) * 2 - VolumeCoordOffset;
+
+		// Triangle filter weight between the shaded voxel and 8 neighbors
+		float4 InterpolationWeights0;
+		InterpolationWeights0.x = (2.0f - abs(SampleOffset000.x)) * (2.0f - abs(SampleOffset000.y)) * (2.0f - abs(SampleOffset000.z));
+		InterpolationWeights0.y = (2.0f - abs(SampleOffset100.x)) * (2.0f - abs(SampleOffset100.y)) * (2.0f - abs(SampleOffset100.z));
+		InterpolationWeights0.z = (2.0f - abs(SampleOffset010.x)) * (2.0f - abs(SampleOffset010.y)) * (2.0f - abs(SampleOffset010.z));
+		InterpolationWeights0.w = (2.0f - abs(SampleOffset110.x)) * (2.0f - abs(SampleOffset110.y)) * (2.0f - abs(SampleOffset110.z));
+		float4 InterpolationWeights1;
+		InterpolationWeights1.x = (2.0f - abs(SampleOffset001.x)) * (2.0f - abs(SampleOffset001.y)) * (2.0f - abs(SampleOffset001.z));
+		InterpolationWeights1.y = (2.0f - abs(SampleOffset101.x)) * (2.0f - abs(SampleOffset101.y)) * (2.0f - abs(SampleOffset101.z));
+		InterpolationWeights1.z = (2.0f - abs(SampleOffset011.x)) * (2.0f - abs(SampleOffset011.y)) * (2.0f - abs(SampleOffset011.z));
+		InterpolationWeights1.w = (2.0f - abs(SampleOffset111.x)) * (2.0f - abs(SampleOffset111.y)) * (2.0f - abs(SampleOffset111.z));
+
+		// Normalize weights
+		InterpolationWeights0 /= 8.0f;
+		InterpolationWeights1 /= 8.0f;
+
+		float3 LightScattering = 0.0f;
+
+		const float FroxelFootprintMargin = 0.5f; // trilinear interpolation
+		if (IsFroxelVisible(VolumeCoord, FroxelFootprintMargin))
+		{
+			// Stochastic sample interpolation. Need to use at least samples 2 for good quality.
+			const float RandomScalar = BlueNoiseScalar(VolumeCoordToNoiseCoord(VolumeCoord), MegaLightsStateFrameIndex);
+			uint3 StochasticTrilinearOffset0 = GetStochasticOffset((RandomScalar + 0.0f) / 2.0f, InterpolationWeights0, InterpolationWeights1);
+			uint3 StochasticTrilinearOffset1 = GetStochasticOffset((RandomScalar + 1.0f) / 2.0f, InterpolationWeights0, InterpolationWeights1);
+
+			uint PackedLightSamples0[NUM_SAMPLES_PER_VOXEL_1D];
+			uint PackedLightSamples1[NUM_SAMPLES_PER_VOXEL_1D];
+			LoadPackedLightSamples(PackedLightSamples0, DownsampledVolumeCoord000 + StochasticTrilinearOffset0);
+			LoadPackedLightSamples(PackedLightSamples1, DownsampledVolumeCoord000 + StochasticTrilinearOffset1);
+
+			uint NextLocalLightIndex = MAX_LOCAL_LIGHT_INDEX;
+			AccumulateLightSample(PackedLightSamples0, NextLocalLightIndex);
+			AccumulateLightSample(PackedLightSamples1, NextLocalLightIndex);
+
+			while (NextLocalLightIndex < MAX_LOCAL_LIGHT_INDEX)
+			{
+				const uint LocalLightIndex = WaveActiveMin(NextLocalLightIndex);
+				if (LocalLightIndex == NextLocalLightIndex)
+				{
+					NextLocalLightIndex = MAX_LOCAL_LIGHT_INDEX;
+					float SampleWeight = 0.0f;
+
+					AccumulateLightSample(PackedLightSamples0, LocalLightIndex, 0.5f, NextLocalLightIndex, SampleWeight);
+					AccumulateLightSample(PackedLightSamples1, LocalLightIndex, 0.5f, NextLocalLightIndex, SampleWeight);
+
+					const FLocalLightData LocalLightData = GetLocalLightDataNonStereo(LocalLightIndex);
+					const FDeferredLightData LightData = ConvertToDeferredLight(LocalLightData);
+
+					#if DEBUG_MODE
+					if (Debug.bActive)
+					{
+						Newline(Debug.Context);
+						Print(Debug.Context, LocalLightIndex);
+						Print(Debug.Context, SampleWeight);
+						Print(Debug.Context, LightScattering);
+					}
+					#endif
+
+					if (SampleWeight > 0.01f)
+					{
+						LightScattering += GetMegaLightsVolumeLighting(TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, LocalLightData, LightData) * SampleWeight;
+					}
+				}
+			}
+		}
+
+		#if DEBUG_MODE
+		if (Debug.bActive)
+		{
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("Lighting: "));
+			Print(Debug.Context, LightScattering);
+		}
+		#endif
+
+		RWVolumeResolvedLighting[VolumeCoord] = LightScattering * View.PreExposure;
+	}
+}

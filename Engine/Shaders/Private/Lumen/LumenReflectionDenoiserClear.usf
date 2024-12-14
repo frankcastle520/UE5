@@ -1,0 +1,29 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneTextureParameters.ush"
+#include "LumenReflectionCommon.ush"
+#include "LumenReflectionDenoiserCommon.ush"
+
+RWTexture2DArray<float3> RWResolvedSpecular;
+RWTexture2DArray<float4> RWSpecularAndSecondMoment;
+
+/**
+ * Clear tiles which won't be processed, so that temporal and spatial denoising passes don't pickup uninitialized values.
+ */
+[numthreads(REFLECTION_THREADGROUP_SIZE_2D, REFLECTION_THREADGROUP_SIZE_2D, 1)]
+void LumenReflectionDenoiserClearCS(
+	uint GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	FReflectionTileData TileData;
+	const uint2 ReflectionScreenCoord = GetReflectionClearScreenCoord(GroupId, GroupThreadId, TileData);	
+
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoord_Reflection(ReflectionScreenCoord + View.ViewRectMinAndSize.xy, TileData);
+
+	if (all(Coord.SvPosition < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+	{
+		RWResolvedSpecular[Coord.SvPositionFlatten] = INVALID_LIGHTING;
+		RWSpecularAndSecondMoment[Coord.SvPositionFlatten] = float4(INVALID_LIGHTING, 0.0f);
+	}
+}

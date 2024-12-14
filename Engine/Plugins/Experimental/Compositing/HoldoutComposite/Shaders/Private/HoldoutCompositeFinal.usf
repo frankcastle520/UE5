@@ -1,0 +1,70 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/GammaCorrectionCommon.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/Engine/Private/LensDistortion.ush"
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+SCREEN_PASS_TEXTURE_VIEWPORT(Custom)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+
+Texture2D CustomTexture;
+SamplerState CustomSampler;
+
+Texture2D<float2> DistortingDisplacementTexture;
+SamplerState DistortingDisplacementSampler;
+
+Texture2D<float2> UndistortingDisplacementTexture;
+SamplerState UndistortingDisplacementSampler;
+
+StructuredBuffer<float4> EyeAdaptationBuffer;
+uint2 Encodings;
+float2 DisplayGamma;
+
+void MainPS(
+    float4 SvPosition : SV_POSITION,
+    out float4 OutColor : SV_Target0
+    )
+{
+    float2 DistortedViewportUV = (SvPosition.xy - Output_ViewportMin) * Output_ViewportSizeInverse;
+    const float2 UndistortedViewportUV = ApplyLensDistortionOnViewportUV(UndistortingDisplacementTexture, UndistortingDisplacementSampler, DistortedViewportUV);
+    
+    const float2 InputUV = (DistortedViewportUV * Input_ViewportSize + Input_ViewportMin) * Input_ExtentInverse;
+    float4 SceneColor = Texture2DSample(InputTexture, InputSampler, InputUV);
+
+    const float2 CustomUV = (UndistortedViewportUV * Custom_ViewportSize + Custom_ViewportMin) * Custom_ExtentInverse;
+    float4 CustomColor = Texture2DSample(CustomTexture, CustomSampler, CustomUV);
+
+#if USE_GLOBAL_EXPOSURE
+    const float GlobalExposure = EyeAdaptationBuffer[0].x;
+    CustomColor.rgb *= GlobalExposure;
+#endif
+
+    BRANCH
+    if(Encodings.x == 1)
+    {
+        SceneColor.rgb = pow(SceneColor.rgb, DisplayGamma.x);
+    }
+    else if(Encodings.x == 2)
+    {
+        SceneColor.rgb = sRGBToLinear(SceneColor.rgb);
+    }
+
+    // TODO: HDR cases will need to be handled explicitely.
+    OutColor.rgb = CustomColor.rgb * SceneColor.a + SceneColor.rgb;
+    OutColor.a = CustomColor.a * SceneColor.a;
+
+    BRANCH
+    if(Encodings.y == 1)
+    {
+        OutColor.rgb = pow(OutColor.rgb, DisplayGamma.y);
+    }
+    else if(Encodings.y == 2)
+    {
+        OutColor.rgb = LinearToSrgb(OutColor.rgb);
+    }
+}

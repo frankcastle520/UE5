@@ -1,0 +1,6 @@
+{
+	// inherit the IOS MinSoftwareVersion
+	"ParentSDKFile": "../../../Config/IOS/IOS_SDK.json",
+
+	"MinVersion": "15.3.0",
+}

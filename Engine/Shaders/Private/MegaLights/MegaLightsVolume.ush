@@ -1,0 +1,175 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../LightFunctionAtlas/LightFunctionAtlasCommon.usf"
+#include "../Nanite/NaniteHZBCull.ush"
+
+/** 
+ * Returns sample jitter offset in the range [0, DOWNSAMPLE_FACTOR - 1]
+ */
+uint3 GetSampleVoxelCoordJitter(uint3 DownsampledVolumeCoord)
+{
+	uint3 CellIndex = DownsampledVolumeCoord % 2;
+	uint LinearIndex = CellIndex.x + CellIndex.y * 2 + CellIndex.z * 4;
+	LinearIndex = (LinearIndex + MegaLightsStateFrameIndex) % 8;
+
+	// #ml_todo: investigate whether this produces a good pattern
+	// 4-rooks sampling pattern
+	uint3 Jitter;
+	Jitter.x = LinearIndex & 0x04 ? 0 : 1;
+	Jitter.y = LinearIndex & 0x02 ? 1 : 0;
+	Jitter.z = LinearIndex & 0x01 ? 0 : 1;
+	return 0;
+}
+
+uint3 DownsampledVolumeCoordToVolumeCoord(uint3 DownsampledVolumeCoord)
+{
+	return DownsampledVolumeCoord * DOWNSAMPLE_FACTOR + GetSampleVoxelCoordJitter(DownsampledVolumeCoord);
+}
+
+uint3 VolumeCoordToDownsampledVolumeCoord(uint3 VolumeCoord)
+{
+	return VolumeCoord / DOWNSAMPLE_FACTOR;
+}
+
+uint2 VolumeCoordToNoiseCoord(uint3 VolumeCoord)
+{
+	// #ml_todo: hard coded for BlueNoise 128x128, but is used for other things too
+	// https://github.com/electronicarts/fastnoise/blob/main/FastNoiseDesign.md
+	return VolumeCoord.xy + R2Sequence(VolumeCoord.z) * 128;
+}
+
+float4x4 UnjitteredClipToTranslatedWorld;
+float3 MegaLightsVolumeZParams;
+uint MegaLightsVolumePixelSize;
+uint MegaLightsVolumePixelSizeShift;
+uint3 VolumeViewSize;
+float LightSoftFading;
+
+float ComputeDepthFromZSlice(float ZSlice)
+{
+	return ComputeDepthFromZSlice(MegaLightsVolumeZParams, ZSlice);
+}
+
+float ComputeZSliceFromDepth(float SliceDepth)
+{
+	return ComputeZSliceFromDepth(MegaLightsVolumeZParams, SliceDepth);
+}
+
+float3 ComputeCellTranslatedWorldPosition(uint3 GridCoordinate, float3 CellOffset, out float SceneDepth)
+{
+	float2 VolumeUV = (GridCoordinate.xy + CellOffset.xy) / float2(VolumeViewSize.xy);
+	float2 VolumeNDC = (VolumeUV * 2 - 1) * float2(1, -1);
+
+	SceneDepth = ComputeDepthFromZSlice(max(GridCoordinate.z + CellOffset.z, 0));
+
+	float TileDeviceZ = ConvertToDeviceZ(SceneDepth);
+	float4 CenterPosition = mul(float4(VolumeNDC, TileDeviceZ, 1), UnjitteredClipToTranslatedWorld);
+	return CenterPosition.xyz / CenterPosition.w;
+}
+
+float VolumePhaseG;
+
+float3 GetMegaLightsVolumeLighting(
+	float3 TranslatedWorldPosition,
+	float3 CameraVector,
+	float DistanceBiasSqr,
+	float LightVolumetricSoftFadeDistance,
+	FLocalLightData LocalLightData,
+	FDeferredLightData LightData)
+{
+	float3 LightScattering = 0.0f;
+
+	const float VolumetricScatteringIntensity = UnpackVolumetricScatteringIntensity(LocalLightData);
+	if (VolumetricScatteringIntensity > 0.0f)
+	{
+		const bool bSoftFadeEnabled = LightSoftFading > 0;
+
+		float3 L = 0;
+		float3 ToLight = 0;
+		float LightMask = GetLocalLightAttenuation(TranslatedWorldPosition, LightData, ToLight, L);
+
+		float Lighting;
+		if (LightData.bRectLight)
+		{
+			FRect Rect = GetRect(ToLight, LightData);
+
+			float SoftFade = 1.0f;
+#if USE_LIGHT_SOFT_FADING
+			if (bSoftFadeEnabled)
+			{
+				SoftFade *= GetRectLightVolumetricSoftFading(LightData, Rect, LightVolumetricSoftFadeDistance, ToLight);
+			}
+#endif
+			Lighting = SoftFade * IntegrateLight(Rect);
+		}
+		else
+		{
+			FCapsuleLight Capsule = GetCapsule(ToLight, LightData);
+			Capsule.DistBiasSqr = DistanceBiasSqr;
+
+			float SoftFade = 1.0f;
+#if USE_LIGHT_SOFT_FADING
+			if (LightData.bSpotLight && bSoftFadeEnabled)
+			{
+				SoftFade *= GetSpotLightVolumetricSoftFading(LightData, LightVolumetricSoftFadeDistance, ToLight);
+			}
+#endif
+			Lighting = SoftFade * IntegrateLight(Capsule, LightData.bInverseSquared);
+		}
+
+		FLightFunctionColor LightFunctionColor = 1.0f;
+#if USE_LIGHT_FUNCTION_ATLAS
+		LightFunctionColor = GetLocalLightFunctionCommon(TranslatedWorldPosition, LightData.LightFunctionAtlasLightIndex);
+#endif
+
+		float CombinedAttenuation = Lighting * LightMask;
+		LightScattering += LightData.Color * LightFunctionColor * (HenyeyGreensteinPhase(VolumePhaseG, dot(L, -CameraVector)) * CombinedAttenuation * VolumetricScatteringIntensity);
+	}
+
+	return LightScattering;
+}
+
+uint UseHZBOcclusionTest;
+
+FScreenRect ComputeFroxelCullRect(uint3 GridCoordinate, float MinTileZ, float MaxTileZ, float FootprintMargin)
+{
+	// Compute extent of tiles in clip-space. Note that the last tile may extend a bit outside of view if view size is not evenly divisible tile size.
+	const float2 InvCulledGridSizeF = (1u << MegaLightsVolumePixelSizeShift) * View.ViewSizeAndInvSize.zw;
+	const float2 TileSize = float2(2.0f, -2.0f) * InvCulledGridSizeF.xy;
+	const float2 UnitPlaneMin = float2(-1.0f, 1.0f);
+
+	float2 UnitPlaneTileMin = (GridCoordinate.xy - FootprintMargin) * TileSize + UnitPlaneMin;
+	float2 UnitPlaneTileMax = (GridCoordinate.xy + 1 + FootprintMargin) * TileSize + UnitPlaneMin;
+
+	float MinTileDeviceZ = ConvertToDeviceZ(MinTileZ);
+	float MaxTileDeviceZ = ConvertToDeviceZ(MaxTileZ);
+
+	float3 CullRectMin;
+	CullRectMin.x = min(UnitPlaneTileMin.x, UnitPlaneTileMax.x);
+	CullRectMin.y = min(UnitPlaneTileMin.y, UnitPlaneTileMax.y);
+	CullRectMin.z = min(MinTileDeviceZ, MaxTileDeviceZ);
+
+	float3 CullRectMax;
+	CullRectMax.x = max(UnitPlaneTileMin.x, UnitPlaneTileMax.x);
+	CullRectMax.y = max(UnitPlaneTileMin.y, UnitPlaneTileMax.y);
+	CullRectMax.z = max(MinTileDeviceZ, MaxTileDeviceZ);
+
+	return GetScreenRect(int4(0, 0, HZBViewSize), CullRectMin, CullRectMax, 4);
+}
+
+bool IsFroxelVisible(uint3 GridCoordinate, float FootprintMargin)
+{
+	if (UseHZBOcclusionTest != 0)
+	{
+		float MinTileZ = ComputeDepthFromZSlice(GridCoordinate.z + 0 - FootprintMargin);
+		float MaxTileZ = ComputeDepthFromZSlice(GridCoordinate.z + 1 + FootprintMargin);
+
+		FScreenRect Rect = ComputeFroxelCullRect(GridCoordinate, MinTileZ, MaxTileZ, FootprintMargin);
+
+		return IsVisibleHZB(Rect, true /*bSample4x4*/);
+	}
+
+	return true;
+}

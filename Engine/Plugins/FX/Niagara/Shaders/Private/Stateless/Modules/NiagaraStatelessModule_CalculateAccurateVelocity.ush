@@ -1,0 +1,10 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../NiagaraStatelessCommon.ush"
+
+void CalculateAccurateVelocity_Simulate(inout FStatelessParticle Particle)
+{  
+	Particle.Velocity			= Particle.Position - Particle.PreviousPosition;
+	Particle.PreviousVelocity	= Particle.Velocity;
+}
+	

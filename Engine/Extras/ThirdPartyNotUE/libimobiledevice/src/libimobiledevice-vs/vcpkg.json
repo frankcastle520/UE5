@@ -1,0 +1,12 @@
+{
+	"dependencies": [
+		"openssl"
+	],
+	"builtin-baseline": "582a4de14bef91df217f4f49624cf5b2b04bd7ca",
+	"overrides": [
+		{
+			"name": "openssl",
+			"version-string": "1.1.1n"
+		}
+	]
+}

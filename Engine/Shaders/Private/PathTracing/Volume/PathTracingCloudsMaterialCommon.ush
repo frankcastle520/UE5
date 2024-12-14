@@ -1,0 +1,72 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Functions related to evaluating volumetric cloud materials in the path tracer
+// This code is for sharing between the cloud acceleration map building and the callable shader version of the cloud material
+
+#include "../../Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "PathTracingVolumeCommon.ush"
+#include "PathTracingCloudsCommon.ush"
+#include "../../DoubleFloat.ush"
+#include "../../SkyAtmosphereCommon.ush"
+
+
+// For path tracing, we need to be able to evaluate the material starting from a single point in space
+// In all contexts, we have a slightly more accurate Height already available so pass that in instead of measuring it from the position
+FSampleCloudMaterialResult SampleCloudMaterial(FDFVector3 AbsoluteWorldPosition, float HeightKm, float CloudBotKm, float CloudTopKm)
+{
+	FMaterialPixelParameters MaterialParameters = MakeInitializedMaterialPixelParameters();
+	float4 SvPosition = 0; // TODO: could derive this from AbsoluteWorldPosition -- but is this needed? VolumetricCloud code doesn't update it per sample
+	FPixelMaterialInputs PixelMaterialInputs = (FPixelMaterialInputs)0;
+	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, true);
+
+	MaterialParameters.WorldPosition_CamRelative = MaterialParameters.WorldPosition_NoOffsets_CamRelative = DFAddDemote(AbsoluteWorldPosition, PrimaryView.PreViewTranslation);
+	MaterialParameters.LWCData = MakeMaterialLWCData(MaterialParameters);
+	MaterialParameters.AbsoluteWorldPosition = MaterialParameters.WorldPosition_NoOffsets = AbsoluteWorldPosition;
+	MaterialParameters.LWCData.AbsoluteWorldPosition = DFToWS(AbsoluteWorldPosition);
+	MaterialParameters.CameraVector = normalize(PrimaryView.TranslatedWorldCameraOrigin - MaterialParameters.WorldPosition_CamRelative);
+
+	MaterialParameters.CloudSampleAltitude = HeightKm * SKY_UNIT_TO_CM;
+	MaterialParameters.CloudSampleAltitudeInLayer = (HeightKm - CloudBotKm) * SKY_UNIT_TO_CM;
+	MaterialParameters.CloudSampleNormAltitudeInLayer = saturate((HeightKm - CloudBotKm) / (CloudTopKm - CloudBotKm));
+	
+	MaterialParameters.VolumeSampleConservativeDensity = 1.0f;
+#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+	MaterialParameters.VolumeSampleConservativeDensity = GetVolumetricAdvancedMaterialOutput6(MaterialParameters);	// Evaluate conservative density
+	if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+	{
+		return (FSampleCloudMaterialResult) 0;
+	}
+#endif
+
+	CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+
+	FSampleCloudMaterialResult Result = (FSampleCloudMaterialResult)0;
+
+#if SUBSTRATE_ENABLED
+	FSubstrateBSDF BSDF = PixelMaterialInputs.FrontMaterial.InlinedBSDF;
+	Result.Extinction = VOLUMETRICFOGCLOUD_EXTINCTION(BSDF).rgb;
+	Result.EmissiveColor = BSDF_GETEMISSIVE(BSDF).rgb;
+	Result.Albedo = VOLUMETRICFOGCLOUD_ALBEDO(BSDF).rgb;
+#else
+#if !MATERIAL_SHADINGMODEL_UNLIT
+	Result.Extinction = GetMaterialSubsurfaceDataRaw(PixelMaterialInputs).rgb;
+	Result.Albedo = GetMaterialBaseColor(PixelMaterialInputs).rgb * View.DiffuseOverrideParameter.w + View.DiffuseOverrideParameter.xyz;
+#endif
+	Result.EmissiveColor = GetMaterialEmissiveRaw(PixelMaterialInputs).rgb;
+#endif
+
+	Result.Extinction = clamp(Result.Extinction * CENTIMETER_TO_METER, 0.0f, 65000.0f);
+	Result.EmissiveColor = clamp(Result.EmissiveColor, 0.0f, 6500.0f);
+	Result.Albedo = saturate(Result.Albedo);
+
+#if MATERIAL_VOLUMETRIC_ADVANCED
+	Result.PhaseG1 = GetVolumetricAdvancedMaterialOutput0(MaterialParameters);
+	Result.PhaseG2 = GetVolumetricAdvancedMaterialOutput1(MaterialParameters);
+	Result.PhaseBlend = GetVolumetricAdvancedMaterialOutput2(MaterialParameters);
+#endif
+
+	return Result;
+}

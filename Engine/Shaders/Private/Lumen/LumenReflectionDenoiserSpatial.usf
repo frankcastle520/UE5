@@ -1,0 +1,158 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneTextureParameters.ush"
+#include "LumenReflectionCommon.ush"
+#include "LumenReflectionDenoiserCommon.ush"
+#if DEBUG_MODE
+	#include "../ShaderPrint.ush"
+#endif
+
+Texture2DArray<float4> SpecularLightingAndSecondMomentTexture;
+Texture2DArray<UNORM float> NumFramesAccumulatedTexture;
+RWTexture2DArray<float4> RWSpecularIndirectAccumulated;
+
+float SpatialFilterDepthWeightScale;
+float SpatialFilterKernelRadius;
+uint SpatialFilterNumSamples;
+float TemporalMaxFramesAccumulated;
+
+float3 TonemapLighting(float3 Lighting, float DisocclusionFactor)
+{
+	// Run heavy tonemapping for DisocclusionFactor in order to suppress fireflies in new areas
+	return Lighting / (1.0f + DisocclusionFactor * Luminance(Lighting));
+}
+
+float3 InverseTonemapLighting(float3 TonemappedLighting, float DisocclusionFactor)
+{
+	return TonemappedLighting / (1.0f - DisocclusionFactor * Luminance(TonemappedLighting));
+}
+
+// Workaround for Substrate fetching invalid value at tile border
+bool IsLightingValidForDenoiser(float3 In)
+{
+#if SUBSTRATE_ENABLED
+	return all(In < INVALID_LIGHTING);
+#else
+	return IsLightingValid(In);
+#endif
+}
+
+/**
+ * Run a spatial filter in order to filter out noise based on the temporal variance.
+ */
+[numthreads(REFLECTION_THREADGROUP_SIZE_2D, REFLECTION_THREADGROUP_SIZE_2D, 1)]
+void LumenReflectionDenoiserSpatialCS(
+	uint GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	FReflectionTileData TileData;
+	const uint2 ReflectionScreenCoord = GetReflectionResolveScreenCoord(GroupId, GroupThreadId, TileData);
+
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoord_Reflection(ReflectionScreenCoord + View.ViewRectMinAndSize.xy, TileData);
+	bool bIsOverflow = TileData.ClosureIndex > 0;
+
+#if DEBUG_MODE
+	int2 DebugScreenCoord = View.CursorPosition.x >= 0 ? View.CursorPosition * View.ViewResolutionFraction : -1;
+	bool bDebug = all(Coord.SvPosition == DebugScreenCoord);
+	FShaderPrintContext Context = InitShaderPrintContext(true, float2(0.55, 0.7));
+#endif
+
+	float4 CenterSpecularLightingAndSecondMoment = RGBAToDenoiserSpace(SpecularLightingAndSecondMomentTexture[Coord.SvPositionFlatten]);
+	if (IsLightingValidForDenoiser(CenterSpecularLightingAndSecondMoment.xyz))
+	{
+		float CenterSpecularStdDev = sqrt(max(CenterSpecularLightingAndSecondMoment.w - Pow2(Luminance(CenterSpecularLightingAndSecondMoment.xyz)), 0.0f));
+
+		const FLumenMaterialData Material = ApplySmoothBias(ReadMaterialData(Coord, MaxRoughnessToTrace), true /*bTopLayerRoughness*/);
+		float DisocclusionFactor = 0.0f;
+
+		// Run relaxed spatial filter until we accumulate enough frames to rely on temporal variance
+		float NumFramesAccumulated = UnpackNumFramesAccumulated(NumFramesAccumulatedTexture[Coord.SvPositionFlatten]);
+		const uint MaxFramesAccumulated = GetMaxFramesAccumulated(TemporalMaxFramesAccumulated, Material.TopLayerRoughness);
+		if (MaxFramesAccumulated > 1)
+		{
+			//DisocclusionFactor = 1.0f - saturate((NumFramesAccumulated - 1.0f) / min(4.0f, MaxFramesAccumulated - 1.0f));
+			DisocclusionFactor = NumFramesAccumulated > 1 ? 0.0f : 1.0f;
+		}
+
+		float3 SpecularLightingSum = TonemapLighting(CenterSpecularLightingAndSecondMoment.xyz, DisocclusionFactor);
+		float SpecularLightingWeightSum = 1.0f;
+
+		float KernelRadiusInPixels = SpatialFilterKernelRadius * saturate(Material.TopLayerRoughness * 8.0f);
+		uint NumSamples = SpatialFilterNumSamples;
+
+		uint2 RandomSeed = Rand3DPCG16(int3(Coord.SvPosition, ReflectionsStateFrameIndexMod8)).xy;
+
+		float2 ScreenUV = (Coord.SvPosition + 0.5f) * View.BufferSizeAndInvSize.zw;
+		float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, Material.SceneDepth);
+		float4 ScenePlane = float4(Material.WorldNormal, dot(TranslatedWorldPosition, Material.WorldNormal));
+
+		float MinStdDev = 0.1f;
+
+		#if SPATIAL_FILTER
+		if (KernelRadiusInPixels > 1.0f && (CenterSpecularStdDev > MinStdDev || DisocclusionFactor > 0.0f))
+		{
+			const float LobeHalfAngle = GetSpecularLobeHalfAngle(Material.TopLayerRoughness) * lerp(1.0f, 2.0f, DisocclusionFactor);
+
+			for (uint NeighborIndex = 0; NeighborIndex < NumSamples; ++NeighborIndex)
+			{
+				float2 NeighborOffsetInRect = Hammersley16(NeighborIndex, NumSamples, RandomSeed);
+				float2 NeighborOffset = UniformSampleDiskConcentric(NeighborOffsetInRect) * KernelRadiusInPixels;
+				int2 NeighborCoord = (int2)(Coord.SvPosition + NeighborOffset);
+
+				if (all(and(NeighborCoord >= View.ViewRectMinAndSize.xy, NeighborCoord < (View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))))
+				{
+					const float2 NeighborScreenUV = (NeighborCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+					const FLumenMaterialCoord NeighborMaterialCoord = GetLumenMaterialCoord(NeighborCoord, Coord.ClosureIndex);
+					const FLumenMaterialData NeighborMaterial = ApplySmoothBias(ReadMaterialData(NeighborMaterialCoord, MaxRoughnessToTrace), true /*bTopLayerRoughness*/);
+
+					// Depth weight
+					const float3 NeighborTranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(NeighborScreenUV, NeighborMaterial.SceneDepth);
+					float PlaneDistance = abs(dot(float4(NeighborTranslatedWorldPosition, -1), ScenePlane));
+					float RelativeDepthDifference = PlaneDistance / Material.SceneDepth;
+					float DepthWeight = exp2(-SpatialFilterDepthWeightScale * (RelativeDepthDifference * RelativeDepthDifference));
+
+					// Normal weight
+					float AngleBetweenNormals = acosFast(saturate(dot(ScenePlane.xyz, NeighborMaterial.WorldNormal)));
+					float NormalWeight = 1.0f - saturate(AngleBetweenNormals / (LobeHalfAngle + 0.01f));
+
+					float3 NeighborSpecularLighting = RGBToDenoiserSpace(SpecularLightingAndSecondMomentTexture[uint3(NeighborCoord, Coord.SvPositionFlatten.z)].xyz);
+					if (IsLightingValidForDenoiser(NeighborSpecularLighting))
+					{
+						float LuminanceDelta = abs(Luminance(CenterSpecularLightingAndSecondMoment.xyz) - Luminance(NeighborSpecularLighting));
+						float LuminanceWeight = exp2(-LuminanceDelta / max(CenterSpecularStdDev, 0.001f));
+
+						LuminanceWeight = lerp(LuminanceWeight, 1.0f, DisocclusionFactor);
+
+						const float SpecularNeighborWeight = DepthWeight * NormalWeight * LuminanceWeight;
+						SpecularLightingSum += TonemapLighting(NeighborSpecularLighting, DisocclusionFactor) * SpecularNeighborWeight;
+						SpecularLightingWeightSum += SpecularNeighborWeight;
+					}
+				}
+			}
+		}
+		#endif
+
+		float3 SpecularLighting = InverseTonemapLighting(SpecularLightingSum / SpecularLightingWeightSum, DisocclusionFactor);
+
+		#if DEBUG_MODE	
+		if (bDebug)
+		{	
+			Print(Context, TEXT("Spatial"));
+			Newline(Context);
+			Print(Context, TEXT("KernelRadiusInPixels: "));
+			Print(Context, KernelRadiusInPixels);
+			Newline(Context);
+			Print(Context, TEXT("CenterSpecularStdDev: "));
+			Print(Context, CenterSpecularStdDev);
+			Newline(Context);
+			Print(Context, TEXT("DisocclusionFactor: "));
+			Print(Context, DisocclusionFactor);
+			Newline(Context);
+			Print(Context, SpecularLighting);
+		}
+		#endif
+
+		RWSpecularIndirectAccumulated[Coord.SvPositionFlatten] = float4(DenoiserSpaceToRGB(SpecularLighting), 1.0f);
+	}
+}

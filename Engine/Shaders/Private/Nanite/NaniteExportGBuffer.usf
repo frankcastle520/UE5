@@ -1,0 +1,371 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../VelocityCommon.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../VariableRateShading/VRSShadingRateCommon.ush"
+#include "../BRDF.ush"
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+#include "NaniteSceneCommon.ush"
+#include "NaniteEditorCommon.ush"
+#include "NaniteVertexDeformation.ush"
+
+
+uint DummyZero; // TODO: Remove me
+uint StencilClear;
+uint StencilDecal;
+uint bWriteCustomStencil; // only used to repurpose EmitSceneDepthStencilPS for custom depth/stencil where possible
+uint MeshPassIndex;
+uint RegularMaterialRasterBinCount;
+
+Texture2D<UlongType> VisBuffer64;
+#if SHADING_MASK_LOAD
+Texture2D<uint> ShadingMask;
+#endif
+StructuredBuffer<FNaniteRasterBinMeta> RasterBinMeta;
+
+// These are only used for custom depth/stencil output
+Texture2D<float> CustomDepth;
+Texture2D<uint2> CustomStencil;
+
+uint GetCustomStencilValue(FPrimitiveSceneData PrimitiveData)
+{
+	uint CustomStencilMask = (PrimitiveData.CustomStencilValueAndMask >> 8u) & 0xFFu;
+	if (CustomStencilMask == 0)
+	{
+		// "Default" mask value of 0 means depth pass = replace, depth fail = keep
+		// TODO: Proper support for ignore-depth, bitwise-or modes (requires a separate 32-bit target)
+		CustomStencilMask = 0xFFu;
+	}
+
+	return PrimitiveData.CustomStencilValueAndMask & CustomStencilMask;
+}
+
+void MarkStencilPS(
+	in float4 SvPosition	: SV_Position,
+	out float OutDepth		: SV_Depth
+)
+{
+	const uint2 PixelPos = (uint2)SvPosition.xy;
+	const UlongType VisPixel = VisBuffer64[PixelPos];
+
+	uint DepthInt = 0;
+	uint VisibleClusterIndex = 0;
+	uint TriIndex = 0;
+	UnpackVisPixel(VisPixel, DepthInt, VisibleClusterIndex, TriIndex);
+
+	if (VisibleClusterIndex != 0xFFFFFFFF)
+	{
+		OutDepth = asfloat(DepthInt);
+	}
+	else
+	{
+		OutDepth = 0.0f;
+		discard;
+	}
+}
+
+void EmitSceneDepthPS(
+	in float4  SvPosition			: SV_Position,
+#if SHADING_MASK_EXPORT
+	out uint   OutShadingMask		: SV_Target0,
+#endif
+#if VELOCITY_EXPORT
+	out float4 OutVelocity			: SV_Target1,
+#endif
+	out float  OutDepth				: SV_Depth
+)
+{
+	uint2 PixelPos = (uint2)SvPosition.xy;
+	UlongType VisPixel = VisBuffer64[PixelPos];
+
+	uint DepthInt = 0;
+	uint VisibleClusterIndex = 0;
+	uint TriIndex = 0;
+	UnpackVisPixel(VisPixel, DepthInt, VisibleClusterIndex, TriIndex);
+
+	if (VisibleClusterIndex != 0xFFFFFFFF)
+	{
+	#if VELOCITY_EXPORT || SHADING_MASK_EXPORT
+		FVisibleCluster VisibleCluster = GetVisibleCluster(VisibleClusterIndex);
+		const FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+		const FInstanceSceneData InstanceData = GetInstanceSceneData(VisibleCluster, false);
+		const FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceData.PrimitiveId);
+	#if VELOCITY_EXPORT
+	#if INSTANCED_STEREO
+		checkSlow(VisibleCluster.ViewId < 2);					// see INSTANCED_VIEW_COUNT in SceneView.h.  
+																// Velocity export uses a per-view TemporalAAJitter anyway, so it is a fair assumption that each NaniteView has a backing FViewInfo at this point.
+		FNaniteView NaniteView = GetNaniteView(VisibleCluster.ViewId);
+		ResolvedView = ResolveView(VisibleCluster.ViewId);
+	#else
+		FNaniteView NaniteView = GetNaniteView(0);
+		ResolvedView = ResolveView();
+	#endif
+	#endif
+	#endif
+
+#if SHADING_MASK_EXPORT
+		const uint ShadingBin			= GetMaterialShadingBin(Cluster, InstanceData.PrimitiveId, MeshPassIndex, TriIndex);
+		const bool bIsDecalReceiver		= (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_DECAL_RECEIVER) != 0 && View.ShowDecalsMask > 0;
+		const bool bHasDistanceField	= (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_HAS_DISTANCE_FIELD_REPRESENTATION) != 0;
+		OutShadingMask = PackShadingMask(
+			ShadingBin,
+			D3D12_SHADING_RATE_1X1,
+			bIsDecalReceiver,
+			bHasDistanceField,
+			GetPrimitive_LightingChannelMask_FromFlags(PrimitiveData.Flags)
+		);
+#endif
+
+	#if VELOCITY_EXPORT
+		// Don't output velocity here for WPO clusters, as their velocity must be calculated in the base pass
+		bool bWPOEnabled = (VisibleCluster.Flags & NANITE_CULLING_FLAG_ENABLE_WPO) != 0;
+		const bool bFallbackRasterBin = (VisibleCluster.Flags & NANITE_CULLING_FLAG_FALLBACK_RASTER) != 0;
+		
+		if (bWPOEnabled)
+		{
+			// The cluster may have WPO enabled, but we want to know if WPO is enabled by the material to decide to output velocity
+			const uint RasterBinIndex = GetMaterialRasterBin(Cluster, InstanceData.PrimitiveId, MeshPassIndex, TriIndex, RegularMaterialRasterBinCount, bFallbackRasterBin);
+			const FNaniteMaterialFlags MaterialFlags = UnpackNaniteMaterialFlags(RasterBinMeta[RasterBinIndex].MaterialFlags);
+			bWPOEnabled &= MaterialFlags.bWorldPositionOffset;
+		}
+
+		OutVelocity = CalculateNaniteVelocity(NaniteView, InstanceData, Cluster, float4(SvPosition.xy, asfloat(DepthInt), 1.0f), TriIndex, PrimitiveData.Flags, bWPOEnabled);
+	#endif
+
+		OutDepth = asfloat(DepthInt);
+	}
+	else
+	{
+	#if SHADING_MASK_EXPORT
+		OutShadingMask = 0;
+	#endif
+	#if VELOCITY_EXPORT
+		OutVelocity = 0;
+	#endif
+		OutDepth = 0.0f;
+		discard;
+	}
+}
+
+#if SHADING_MASK_LOAD
+
+void EmitSceneStencilPS(
+	in float4 SvPosition	: SV_Position,
+	out float OutDepth		: SV_Depth
+)
+{
+	const uint2 PixelPos = (uint2)SvPosition.xy;
+
+	FShadingMask UnpackedMask = UnpackShadingMask(ShadingMask[PixelPos]);
+
+	BRANCH
+	if (UnpackedMask.bIsNanitePixel && UnpackedMask.bIsDecalReceiver)
+	{
+		UlongType VisPixel = VisBuffer64[PixelPos];
+		uint DepthInt = 0;
+		uint VisibleClusterIndex = 0;
+		uint TriIndex = 0;
+		UnpackVisPixel(VisPixel, DepthInt, VisibleClusterIndex, TriIndex);
+		OutDepth = asfloat(DepthInt);
+	}
+	else
+	{
+		OutDepth = 0.0f;
+		discard;
+	}
+}
+
+#endif
+
+void EmitCustomDepthStencilPS
+(
+	in float4	SvPosition	: SV_Position
+#if WRITE_CUSTOM_STENCIL
+	, out uint2	OutStencil	: SV_Target0
+#endif
+	, out float	OutDepth	: SV_Depth
+)
+{
+	uint2 PixelPos = (uint2)SvPosition.xy;
+	UlongType VisPixel = VisBuffer64[PixelPos];
+
+	// We'll read the custom depth/stencil values from SRV and output them to separate texture RT and depth
+	float SceneDepth = CustomDepth[PixelPos];
+	uint SceneStencil = CustomStencil[PixelPos] STENCIL_COMPONENT_SWIZZLE;
+
+#if WRITE_CUSTOM_STENCIL
+	OutStencil = (uint2)0;
+#endif
+
+	uint DepthInt = 0;
+	uint VisibleClusterIndex = 0;
+	uint TriIndex = 0;
+	UnpackVisPixel(VisPixel, DepthInt, VisibleClusterIndex, TriIndex);
+	
+	const float NaniteDepth = asfloat(DepthInt);
+
+	if (VisibleClusterIndex != 0xFFFFFFFF && NaniteDepth > SceneDepth)
+	{
+		OutDepth = NaniteDepth;
+
+	#if WRITE_CUSTOM_STENCIL
+		FVisibleCluster VisibleCluster = GetVisibleCluster(VisibleClusterIndex);
+		const FInstanceSceneData InstanceData = GetInstanceSceneData(VisibleCluster, false);
+		const FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceData.PrimitiveId);
+
+		OutStencil STENCIL_COMPONENT_SWIZZLE = GetCustomStencilValue(PrimitiveData);
+	#endif
+	}
+	else
+	{
+		OutDepth = SceneDepth;
+
+	#if WRITE_CUSTOM_STENCIL
+		OutStencil STENCIL_COMPONENT_SWIZZLE = SceneStencil;
+	#endif
+	}
+}
+
+float ViewToClip22; 
+float DepthBias;
+
+Texture2D< uint > DepthBuffer;
+
+void EmitShadowMapPS(
+	in float4 SvPosition	: SV_Position,
+	out float OutDepth		: SV_Depth
+)
+{
+	OutDepth = 0;
+
+	uint2 PixelPos = (uint2)SvPosition.xy;
+	uint DepthInt = DepthBuffer[ PixelPos ];
+
+	if( DepthInt != 0 )
+	{
+		float DeviceZ = asfloat( DepthInt );
+
+#if DEPTH_OUTPUT_TYPE == 0
+		// Standard depth
+		OutDepth = DeviceZ;
+#elif DEPTH_OUTPUT_TYPE == 1
+		// Ortho shadow maps
+		OutDepth = 1 - DeviceZ + DepthBias;
+#else
+		// Perspective shadow maps
+		OutDepth = ViewToClip22 * ( DeviceZ - 1 ) / ( DeviceZ - ViewToClip22 ) + DepthBias;
+		//MinZ = View.ViewToClip[3][2] / ( 1 - View.ViewToClip[2][2] );
+		//ViewZ = View.ViewToClip[3][2] / ( DeviceZ - View.ViewToClip[2][2] );
+#endif
+	}
+	else
+	{
+		discard;
+	}
+}
+
+void EmitHitProxyIdPS(
+	in float4 SvPosition		: SV_Position,
+	out float4 OutHitProxyId	: SV_Target0,
+	out float OutDepth			: SV_Depth
+)
+{
+#if USE_EDITOR_SHADERS
+	uint2 PixelPos = (uint2)SvPosition.xy;
+	UlongType VisPixel = VisBuffer64[PixelPos];
+
+	uint VisibleClusterIndex = 0;
+	uint TriIndex = 0;
+	uint DepthInt = 0;
+	UnpackVisPixel(VisPixel, DepthInt, VisibleClusterIndex, TriIndex);
+
+	bool bValidExport = VisibleClusterIndex != 0xFFFFFFFFu;
+	if (bValidExport)
+	{
+		FVisibleCluster VisibleCluster = GetVisibleCluster(VisibleClusterIndex);
+		FInstanceSceneData InstanceData = GetInstanceSceneData(VisibleCluster, false);
+
+		BRANCH
+		if ((InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_EDITOR_DATA) != 0u)
+		{
+			OutHitProxyId = float4(InstanceData.EditorData.HitProxyId, 0.0f);
+		}
+		else
+		{
+			FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+			const uint MaterialHitProxyPacked = GetMaterialHitProxyId(Cluster, InstanceData.PrimitiveId, TriIndex, MaterialHitProxyTable);
+			OutHitProxyId = float4(UnpackHitProxyId(MaterialHitProxyPacked), 0.0f);
+		}
+
+		OutDepth = asfloat(DepthInt);
+	}
+	else
+	{
+		OutHitProxyId = 0;
+		OutDepth = 0.0f;
+		discard;
+	}
+#else
+	OutHitProxyId = 0;
+	OutDepth = 0.0f;
+	discard;
+#endif // USE_EDITOR_SHADERS
+}
+
+float2 OutputToInputScale;
+float2 OutputToInputBias;
+
+// This shader is used to output depth (and stencil) for both editor selection outlines and visualize level instances.
+// Additionally, it is used to output editor overlay colors.
+void EmitEditorSelectionDepthPS(
+	float4 SvPosition  : SV_Position
+#if EMIT_OVERLAY
+	, out float4 OutOverlay : SV_Target0
+#endif
+	, out float OutDepth : SV_Depth
+)
+{
+	uint DepthInt = 0;
+	float4 OverlayColor = 0;
+	bool bValidExport = false;
+
+#if USE_EDITOR_SHADERS
+	uint2 PixelPos = (uint2)(SvPosition.xy * OutputToInputScale + OutputToInputBias);
+	UlongType VisPixel = VisBuffer64[PixelPos];
+
+	uint VisibleClusterIndex = 0;
+	uint TriIndex = 0;
+	UnpackVisPixel(VisPixel, DepthInt, VisibleClusterIndex, TriIndex);
+
+	bValidExport = VisibleClusterIndex != 0xFFFFFFFF;
+
+	if (bValidExport)
+	{
+		FVisibleCluster VisibleCluster = GetVisibleCluster(VisibleClusterIndex);
+		const FInstanceSceneData InstanceData = GetInstanceSceneData(VisibleCluster, false);
+#if ONLY_SELECTED
+		const bool bIsSelected = IsInstanceSelected(InstanceData, VisibleCluster, TriIndex);
+		if (!bIsSelected)
+		{
+			discard;
+		}
+#endif // ONLY_SELECTED
+#if EMIT_OVERLAY
+		OverlayColor = LoadNaniteMaterialOverlayColor(InstanceData.PrimitiveId);
+#endif // EMIT_OVERLAY
+	}
+	
+#endif // USE_EDITOR_SHADERS
+
+#if EMIT_OVERLAY
+	OutOverlay = OverlayColor;
+#endif
+	OutDepth = asfloat(DepthInt);
+	if (!bValidExport)
+	{
+		discard;
+	}
+}

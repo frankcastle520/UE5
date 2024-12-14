@@ -1,0 +1,292 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Change this to force recompilation of all MegaLights shaders
+#pragma message("UESHADERMETADATA_VERSION 20B31250-3221-44EF-8034-AC9A233C2022")
+
+// Keep in sync with MegaLights::ETileType
+#define TILE_MODE_SIMPLE_SHADING				0
+#define TILE_MODE_COMPLEX_SHADING				1
+#define TILE_MODE_SIMPLE_SHADING_RECT			2
+#define TILE_MODE_COMPLEX_SHADING_RECT			3
+#define TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED	4
+#define TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED	5
+#define TILE_MODE_EMPTY							6
+#define TILE_MODE_MAX							7
+
+bool IsSimpleShadingTileType(uint TileType)
+{
+	return TileType == TILE_MODE_SIMPLE_SHADING
+		|| TileType == TILE_MODE_SIMPLE_SHADING_RECT
+		|| TileType == TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED;
+}
+
+bool IsRectLightTileType(uint TileType)
+{
+	return TileType == TILE_MODE_SIMPLE_SHADING_RECT
+		|| TileType == TILE_MODE_COMPLEX_SHADING_RECT
+		|| TileType == TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED
+		|| TileType == TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED;
+}
+
+bool IsTexturedLightTileType(uint TileType)
+{ 
+	return TileType == TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED
+		|| TileType == TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED;
+}
+
+#if TILE_TYPE == TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED || TILE_TYPE == TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED
+	#define USE_SOURCE_TEXTURE 1
+#else
+	#define USE_SOURCE_TEXTURE 0
+#endif
+
+#include "../LightGridCommon.ush"
+#define SUPPORT_CONTACT_SHADOWS 0
+#define NON_DIRECTIONAL_DIRECT_LIGHTING 0
+#include "../DeferredLightingCommon.ush"
+#include "../SceneData.ush"
+#include "../Hash.ush"
+
+#if DEBUG_MODE
+	#include "../ShaderPrint.ush"
+	#define FontValue FontWhite
+	#define FontSelected FontRed
+	#define FontTitle FontEmerald
+#endif
+
+#include "../Lumen/LumenPosition.ush"
+#include "../HairStrands/HairStrandsEnvironmentLightingCommon.ush"
+
+#define DEBUG_MODE_VISUALIZE_TRACING  1
+#define DEBUG_MODE_VISUALIZE_SAMPLING 2
+
+// Keep in sync with MegaLights.cpp
+#define DOWNSAMPLE_FACTOR			2
+#define TILE_SIZE					8
+// Limited by PackLightSample and PackCandidateLightSample
+#define MAX_LOCAL_LIGHT_NUM			4096
+#define MAX_LOCAL_LIGHT_INDEX		(MAX_LOCAL_LIGHT_NUM - 1)
+#define SHARED_LIGHT_MASK_SIZE		(MAX_LOCAL_LIGHT_NUM / 32)
+#define VISIBLE_LIGHT_HASH_SIZE		4 // 4 uints
+
+#if DEBUG_MODE
+void PrintTileTypeString(inout FShaderPrintContext Context, uint TileType, FFontColor InColor = FontWhite)
+{
+	switch (TileType)
+	{
+		case TILE_MODE_SIMPLE_SHADING:							Print(Context, TEXT("Simple               "), InColor); break;
+		case TILE_MODE_COMPLEX_SHADING:							Print(Context, TEXT("Complex              "), InColor); break;
+		case TILE_MODE_SIMPLE_SHADING_RECT:						Print(Context, TEXT("Simple Rect          "), InColor); break;
+		case TILE_MODE_COMPLEX_SHADING_RECT:					Print(Context, TEXT("Complex Rect         "), InColor); break;
+		case TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED:			Print(Context, TEXT("Simple Textured Rect "), InColor); break;
+		case TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED:			Print(Context, TEXT("Complex Textured Rect"), InColor); break;
+		case TILE_MODE_EMPTY:									Print(Context, TEXT("Empty                "), InColor); break;
+	}
+}
+#endif
+
+struct FDebug
+{
+#if DEBUG_MODE
+	bool bActive;
+	FShaderPrintContext Context;
+#endif
+};
+
+uint bOverrideCursorPosition;
+int2 GetDebugScreenCoord()
+{
+	const int2 OverrideCursorPosition = View.ViewSizeAndInvSize.xy / 2;
+	const int2 CursorPosition = bOverrideCursorPosition > 0 ? OverrideCursorPosition : View.CursorPosition * View.ViewResolutionFraction;
+	const int2 DebugScreenCoord = CursorPosition.x >= 0 ? View.ViewRectMin.xy + CursorPosition : -1;	
+	return DebugScreenCoord;
+}
+
+uint PackTile(uint2 TileCoord)
+{
+	return TileCoord.x | (TileCoord.y << 16);
+}
+
+uint2 UnpackTile(uint PackedTile)
+{
+	return uint2(PackedTile & 0xFFFF, PackedTile >> 16);
+}
+
+struct FLightSample
+{
+	uint LocalLightIndex;
+	float Weight;
+	bool bVisible;
+	bool bCompleted; // Whether tracing was completed
+	bool bGuidedAsVisible;
+	bool bGuidedAsPartiallyVisibleLight;
+	bool bSupportScreenTrace;
+};
+
+FLightSample InitLightSample()
+{
+	FLightSample LightSample;
+	LightSample.LocalLightIndex = MAX_LOCAL_LIGHT_INDEX;
+	LightSample.Weight = 0.0f;
+	LightSample.bVisible = false;
+	LightSample.bCompleted = true;
+	LightSample.bGuidedAsVisible = true;
+	LightSample.bGuidedAsPartiallyVisibleLight = false;
+	LightSample.bSupportScreenTrace = true;
+	return LightSample;
+}
+
+uint PackLightSample(FLightSample LightSample)
+{
+	uint PackedLightSample = LightSample.LocalLightIndex & 0xFFF;
+	PackedLightSample |= LightSample.bVisible ? 0x8000 : 0;
+	PackedLightSample |= LightSample.bCompleted ? 0x4000 : 0;
+	PackedLightSample |= LightSample.bGuidedAsVisible ? 0x2000 : 0;
+	PackedLightSample |= LightSample.bGuidedAsPartiallyVisibleLight ? 0x1000 : 0;
+	PackedLightSample |= LightSample.bSupportScreenTrace ? 0x10000 : 0;
+	PackedLightSample |= (f32tof16(LightSample.Weight) & 0xFFFE) << 16;
+	return PackedLightSample;
+}
+
+FLightSample UnpackLightSample(uint PackedLightSample)
+{
+	FLightSample LightSample;
+	LightSample.LocalLightIndex = PackedLightSample & 0xFFF;
+	LightSample.bVisible = PackedLightSample & 0x8000 ? true : false;
+	LightSample.bCompleted = PackedLightSample & 0x4000 ? true : false;
+	LightSample.bGuidedAsVisible = PackedLightSample & 0x2000 ? true : false;
+	LightSample.bGuidedAsPartiallyVisibleLight = PackedLightSample & 0x1000 ? true : false;
+	LightSample.bSupportScreenTrace = PackedLightSample & 0x10000 ? true : false;
+	LightSample.Weight = f16tof32((PackedLightSample >> 16) & 0xFFFE);
+	return LightSample;
+}
+
+uint PackLightSampleUV(float2 UV)
+{
+	uint V;
+	V = uint(UV.x * 255.0f + 0.5f);
+	V |= uint(UV.y * 255.0f + 0.5f) << 8;
+	return V;
+}
+
+float2 UnpackLightSampleUV(uint V)
+{
+	float2 UV;
+	UV.x = (V & 0xFF) / 255.0f;
+	UV.y = (V >> 8) / 255.0f;
+	return UV;
+}
+
+uint MegaLightsStateFrameIndex;
+
+/** 
+ * Returns sample jitter offset in the range [0, DOWNSAMPLE_FACTOR - 1]
+ */
+uint2 GetSampleScreenCoordJitter(uint2 DownsampledScreenCoord)
+{
+	uint2 CellIndex = DownsampledScreenCoord % 2;
+	uint LinearIndex = CellIndex.x + CellIndex.y * 2;
+	LinearIndex = (LinearIndex + MegaLightsStateFrameIndex) % 4;
+
+	// 4-rooks sampling pattern
+	uint2 Jitter;
+	Jitter.x = LinearIndex & 0x02 ? 1 : 0;
+	Jitter.y = LinearIndex & 0x01 ? 0 : 1;
+	return Jitter;
+}
+
+uint2 DownsampledScreenCoordToScreenCoord(uint2 DownsampledScreenCoord)
+{
+	return DownsampledScreenCoord * DOWNSAMPLE_FACTOR + GetSampleScreenCoordJitter(DownsampledScreenCoord);
+}
+
+float2 DownsampledScreenCoordToScreenUV(uint2 DownsampledScreenCoord)
+{
+	uint2 ScreenCoord = DownsampledScreenCoordToScreenCoord(DownsampledScreenCoord);
+	float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+	return ScreenUV;
+}
+
+struct FMegaLightsMaterial
+{
+	float  Depth;
+	float3 WorldNormal;
+	float3 WorldNormalForPositionBias;
+	float  Roughness;
+	bool   bIsValid;
+	bool   bIsSimple;
+	bool   bIsHair;
+	bool   bNeedsSeparateSubsurfaceLightAccumulation;
+	bool   bAllowSpatialFilter;
+
+	float3 DiffuseColor;
+	float3 SpecularColor;
+
+	bool IsValid()
+	{
+		return bIsValid;
+	}
+
+	bool IsSimple()
+	{
+		return bIsSimple;
+	}
+
+	void SetDepth(float In)
+	{
+		Depth = In;
+		#if !SUBSTRATE_ENABLED
+		GBuffer.Depth = In;
+		#endif
+	}
+
+	#if !SUBSTRATE_ENABLED
+	FGBufferData GBuffer;
+	#endif
+};
+
+// Remove texture detail before denoising
+void DemodulateLighting(FMegaLightsMaterial Material, float3 TranslatedWorldPosition, inout float3 DiffuseLighting, inout float3 SpecularLighting)
+{
+	const float3 N = Material.WorldNormal;
+	const float3 V = normalize(View.TranslatedWorldCameraOrigin - TranslatedWorldPosition);
+	const float NoV = saturate(dot(N, V));
+	float3 SpecularEnv = EnvBRDF(Material.SpecularColor, Material.Roughness, NoV);
+	
+	// Hair should technically use the follow function, but it is expansive and does not improve visuals/stability. 
+	#if 0
+	if (Material.bIsHair)
+	{
+		float3 L = 0;
+		SpecularEnv = EvaluateEnvHair(Material.GBuffer, V, N, L /*out*/);
+	}
+	#endif
+
+	// #ml_todo: demodulate earlier during BRDF evaluation
+	DiffuseLighting = DiffuseLighting / max(Material.DiffuseColor, 0.001f);
+	SpecularLighting = SpecularLighting / max(SpecularEnv, 0.001f);	
+}
+
+// Restore texture detail after denoising
+void ModulateLighting(FMegaLightsMaterial Material, float3 TranslatedWorldPosition, inout float3 DiffuseLighting, inout float3 SpecularLighting)
+{
+	const float3 N = Material.WorldNormal;
+	const float3 V = normalize(View.TranslatedWorldCameraOrigin - TranslatedWorldPosition);
+	const float NoV = saturate(dot(N, V));
+	float3 SpecularEnv = EnvBRDF(Material.SpecularColor, Material.Roughness, NoV);
+
+	// Hair should technically use the follow function, but it is expansive and does not improve visuals/stability. 
+	#if 0
+	if (Material.bIsHair)
+	{
+		float3 L = 0;
+		SpecularEnv = EvaluateEnvHair(Material.GBuffer, V, N, L /*out*/);
+	}
+	#endif
+
+	// Final pass outputs composites irradiance and outputs it to scene color
+	DiffuseLighting = DiffuseLighting * max(Material.DiffuseColor, 0.001f);
+	SpecularLighting = SpecularLighting * max(SpecularEnv, 0.001f);
+}

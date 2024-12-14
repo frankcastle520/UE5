@@ -1,0 +1,10 @@
+{
+	"statusPanelLinks": [
+		{
+			"label": "ushell",
+			"fileName": "$(COMSPEC)",
+			"arguments": "/D /K \"\"$(ToolDir)\\ushell.bat\" --project=\"$(ProjectFile)\"\"",
+			"workingDir": "$(ProjectDir)"
+		}
+	]
+}

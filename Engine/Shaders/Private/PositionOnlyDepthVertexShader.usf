@@ -1,0 +1,49 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PositionOnlyDepthOnlyVertexShader.hlsl: Depth-only vertex shader.
+=============================================================================*/
+
+#include "Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+
+void Main(
+	FPositionOnlyVertexFactoryInput Input,
+	out INVARIANT_OUTPUT float4 OutPosition : SV_POSITION
+#if USE_GLOBAL_CLIP_PLANE
+	, out float OutGlobalClipPlaneDistance : SV_ClipDistance
+#endif
+#if INSTANCED_STEREO && MOBILE_MULTI_VIEW // Mobile multi view fallback path
+	, out uint LayerIndex : SV_RenderTargetArrayIndex
+#elif MOBILE_MULTI_VIEW
+	, in nointerpolation uint ViewId : SV_ViewID
+#elif INSTANCED_STEREO
+	, out uint ViewportIndex : SV_ViewPortArrayIndex
+#endif
+	)
+{
+#if INSTANCED_STEREO
+	uint EyeIndex = GetEyeIndexFromVF(Input);
+	ResolvedView = ResolveViewFromVF(Input);
+	#if MOBILE_MULTI_VIEW
+		LayerIndex = EyeIndex;
+	#else
+		ViewportIndex = EyeIndex;
+	#endif
+#elif MOBILE_MULTI_VIEW
+	ResolvedView = ResolveView(ViewId);
+#else
+	ResolvedView = ResolveViewFromVF(Input);
+#endif
+
+	float4 WorldPos = VertexFactoryGetWorldPosition(Input);
+
+	{
+		OutPosition = INVARIANT(mul(WorldPos, ResolvedView.TranslatedWorldToClip));
+	}
+
+#if USE_GLOBAL_CLIP_PLANE
+	OutGlobalClipPlaneDistance = dot(ResolvedView.GlobalClippingPlane, float4(WorldPos.xyz, 1));
+#endif
+}

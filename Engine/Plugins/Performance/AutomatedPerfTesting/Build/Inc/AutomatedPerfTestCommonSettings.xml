@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../../../../../Engine/Build/Graph/Schema.xsd" >
+
+	<!-- Insights Setup for Automated Perf Testing -->
+	<!-- since we need to tell UAT whether or not to using the shipping configuration of Insights when processing -->
+	<!-- insights traces after the conclusion of the test --> 
+	<Option Name="UseShippingInsights" Restrict="true|false" DefaultValue="false" Description="Whether or not to use the shipping configuration of Insights." />
+
+	<!-- then we'll use that to override values that will be picked up by the rest of BuildAndTestProject.xml -->
+	<Property Name="IncludeUnrealInsightsInToolCompile" Value="true" />
+	<Property Name="UnrealInsightsBuildConfiguration" Value="Development" If="!$(UseShippingInsights)" />
+	<Property Name="UnrealInsightsBuildConfiguration" Value="Shipping" If="$(UseShippingInsights)" />
+	
+	<!-- Other common arguments --> 
+	<Option Name="TestID" DefaultValue="" Description="A string to use to identify these performance tests" />
+	<Option Name="DeviceProfileOverride" DefaultValue="" Description="Which device profile to use for this test instead of the default value. Will be prepended by PlatformName." />
+	<Option Name="DoInsightsTrace" DefaultValue="false" Restrict="true|false" Description="Whether or not to use Unreal Insights to trace and parse performance results." />
+	<Option Name="DoCSVProfiler" DefaultValue="true" Restrict="true|false" Description="Whether or not to use CSVProfiler to gather and parse performance telemetry." />
+	<Option Name="PerfReportServer" DefaultValue="false" Restrict="true|false" Description="Whether or not to use CSVProfiler to gather and parse performance telemetry." />
+	<Option Name="DoFPSChart" DefaultValue="false" Restrict="true|false" Description="Whether or not to use FPS Chart to gather and parse performance telemetry." />
+	<Option Name="TraceChannels" DefaultValue="default,screenshot,stats" Description="Which channels to use when tracing with Insights" />
+	<Option Name="DoVideoCapture" Restrict="true|false" DefaultValue="false" Description="Whether or not to capture video during the test" />
+	<Option Name="DataSourceName" DefaultValue="Automation.$(ProjectName).Performance" Description="To which PRS data source should this be uploaded"/>
+	<Option Name="PerfCacheRoot" DefaultValue="$(RootDir)/$(ProjectPath)/PerfCache" Description="Path to the perf cache where all the output data is stored. Defaults to a path in the local project's directory. Override to a common network-accessible path when running on build machines"/>
+	<Option Name="GenerateLocalReports" DefaultValue="false" Restrict="true|false" Description="Whether or not to create a local PerfReportTool report" />
+	
+	<!-- Construct the common arguments for the performance test and report commands -->
+	<Property Name="AutomatedPerformanceCommonArgs" Value = "-AutomatedPerfTest.UseShippingInsights=$(UseShippingInsights)" />
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.TestName=$(TestID)"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.DeviceProfileOverride=$(DeviceProfileOverride)" If="'$(DeviceProfileOverride)' != ''"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.DoInsightsTrace" If="$(DoInsightsTrace)"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.TraceChannels=$(TraceChannels)" If="$(DoInsightsTrace) and '$(TraceChannels)' != ''"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.DoCSVProfiler" If="$(DoCSVProfiler)"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.DoFPSChart" If="$(DoFPSChart)"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.PerfCacheRoot=$(PerfCacheRoot)"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -PerfReportServer" If="$(PerfReportServer) And $(DoCSVProfiler)"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -NoLocalReports" If="!$(GenerateLocalReports) And $(DoCSVProfiler)" />
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -resX=3840 -resY=2160"/>
+	<Property Name="AutomatedPerformanceCommonArgs" Value="$(AutomatedPerformanceCommonArgs) -AutomatedPerfTest.DoVideoCapture" If="$(DoVideoCapture)"/>
+
+</BuildGraph>

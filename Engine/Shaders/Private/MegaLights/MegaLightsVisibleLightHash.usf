@@ -1,0 +1,94 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "MegaLights.ush"
+
+Texture2D<uint> LightSamples;
+Texture2D<uint> LightSampleUVTexture;
+
+RWStructuredBuffer<uint> RWVisibleLightHash;
+RWStructuredBuffer<uint> RWVisibleLightMaskHash;
+uint2 VisibleLightHashViewMinInTiles;
+uint2 VisibleLightHashViewSizeInTiles;
+
+/**
+ * Prepare visible light list for light guiding in the next frame
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void VisibleLightHashCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{	
+	uint VisibleLightHash[VISIBLE_LIGHT_HASH_SIZE];
+	uint VisibleLightMaskHash[VISIBLE_LIGHT_HASH_SIZE];
+	for (uint IndexInHash = 0; IndexInHash < VISIBLE_LIGHT_HASH_SIZE; ++IndexInHash)
+	{
+		VisibleLightHash[IndexInHash] = 0;
+		VisibleLightMaskHash[IndexInHash] = 0;
+	}
+
+	const uint2 TileCoord = VisibleLightHashViewMinInTiles + GroupId.xy;
+	const uint2 TileSampleCoord = TileCoord * 4 * uint2(NUM_SAMPLES_PER_PIXEL_2D_X, NUM_SAMPLES_PER_PIXEL_2D_Y);
+	const uint2 TileSampleCoordMax = (TileCoord + 1) * 4 * uint2(NUM_SAMPLES_PER_PIXEL_2D_X, NUM_SAMPLES_PER_PIXEL_2D_Y);
+	
+	const uint NumSamplesPerThreadX = DivideAndRoundUp(4 * NUM_SAMPLES_PER_PIXEL_2D_X, THREADGROUP_SIZE);
+	const uint NumSamplesPerThreadY = DivideAndRoundUp(4 * NUM_SAMPLES_PER_PIXEL_2D_Y, THREADGROUP_SIZE);
+
+	for (uint SampleOffsetY = 0; SampleOffsetY < NumSamplesPerThreadY; ++SampleOffsetY)
+	{
+		for (uint SampleOffsetX = 0; SampleOffsetX < NumSamplesPerThreadX; ++SampleOffsetX)
+		{
+			uint2 SampleCoord = TileSampleCoord + GroupThreadId.xy * uint2(NumSamplesPerThreadX, NumSamplesPerThreadY) + uint2(SampleOffsetX, SampleOffsetY);
+			if (all(SampleCoord < TileSampleCoordMax))
+			{
+				FLightSample LightSample = UnpackLightSample(LightSamples[SampleCoord]);
+				if (LightSample.bVisible)
+				{
+					uint Hash = PCGHash(LightSample.LocalLightIndex);
+
+					// Mark light
+					{
+						uint WrappedLocalLightIndex = Hash % (4 * 32);
+						uint DWORDIndex = WrappedLocalLightIndex / 32;
+						uint BitMask = 1u << (WrappedLocalLightIndex % 32);
+						VisibleLightHash[DWORDIndex] |= BitMask;
+
+						WrappedLocalLightIndex = (Hash >> 8) % (4 * 32);
+						DWORDIndex = WrappedLocalLightIndex / 32;
+						BitMask = 1u << (WrappedLocalLightIndex % 32);
+						VisibleLightHash[DWORDIndex] |= BitMask;
+					}
+
+					// Mark light mask
+					{
+						float2 LightSampleUV = UnpackLightSampleUV(LightSampleUVTexture[SampleCoord]);
+
+						uint2 RandomCoord;
+						RandomCoord.x = LightSampleUV.x > 0.5f ? 1 : 0;
+						RandomCoord.y = LightSampleUV.y > 0.5f ? 1 : 0;
+
+						uint WrappedLocalLightIndex = (Hash >> 16) % 32;
+						uint DWORDIndex = WrappedLocalLightIndex / 8;
+						uint BitMask = 1u << (4 * (WrappedLocalLightIndex % 8) + RandomCoord.x + 2 * RandomCoord.y);
+						VisibleLightMaskHash[DWORDIndex] |= BitMask;
+					}
+				}
+			}
+		}
+	}
+
+	for (uint IndexInHash = 0; IndexInHash < VISIBLE_LIGHT_HASH_SIZE; ++IndexInHash)
+	{
+		VisibleLightHash[IndexInHash] = WaveActiveBitOr(VisibleLightHash[IndexInHash]);
+		VisibleLightMaskHash[IndexInHash] = WaveActiveBitOr(VisibleLightMaskHash[IndexInHash]);
+	}
+
+	uint LaneIndex = WavePrefixCountBits(true);
+	if (LaneIndex < VISIBLE_LIGHT_HASH_SIZE)
+	{
+		const uint HashBufferBase = VISIBLE_LIGHT_HASH_SIZE * (TileCoord.y * VisibleLightHashViewSizeInTiles.x + TileCoord.x);
+		InterlockedOr(RWVisibleLightHash[HashBufferBase + LaneIndex], VisibleLightHash[LaneIndex]);
+		InterlockedOr(RWVisibleLightMaskHash[HashBufferBase + LaneIndex], VisibleLightMaskHash[LaneIndex]);
+	}
+}

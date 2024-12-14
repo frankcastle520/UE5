@@ -1,0 +1,39 @@
+details.graphcontrolpanel {
+    line-height: 1.0;
+}
+
+details.graphcontrolpanel p {
+    margin-bottom: 5px;
+}
+
+details.graphcontrolpanel button {
+    line-height: 1.0;
+    font-size: smaller;
+    padding: 1px;
+}
+
+details.graphcontrolpanel div.col{
+    font-size: smaller;
+    padding-left:5px;
+    padding-right:5px;
+}
+
+details.graphcontrolpanel div.row.form-check{
+    padding: 1px 1px 1px 7px;
+    margin-left:3px;
+    margin-right:0px;
+}
+
+details.graphcontrolpanel input.form-check-input {
+    margin-top: 0;
+}
+
+details.graphcontrolpanel label {
+    margin-bottom: 0;
+}
+
+details.graphcontrolpanel a {
+    font-size: smaller;
+    border: 1px;
+    border-color: transparent;
+}

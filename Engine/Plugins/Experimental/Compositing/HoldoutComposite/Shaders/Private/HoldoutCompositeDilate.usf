@@ -1,0 +1,114 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+
+#ifndef TILE_SIZE
+    #error TILE_SIZE must be defined
+#endif
+
+#define KERNEL_COUNT 8
+#define ALPHA_THRESHOLD 0.5f // Custom render passes are opaque-only currently
+
+// Number of texels arround the group tile for scene color.
+#define LDS_TILE_BORDER_SIZE (1)
+
+// Width in texels of the depth tile cached into LDS.
+#define LDS_TILE_WIDTH (TILE_SIZE + 2 * LDS_TILE_BORDER_SIZE)
+
+// Total number of texels cached in the scene color tile.
+#define LDS_ARRAY_SIZE (LDS_TILE_WIDTH * LDS_TILE_WIDTH)
+
+#define THREADGROUP_TOTAL (TILE_SIZE * TILE_SIZE)
+
+Texture2D InputTexture;
+RWTexture2D<float4> RWOutputTexture;
+uint2 Dimensions;
+
+static const int2 kOffsets[KERNEL_COUNT] = {
+    int2(-1,  0),
+    int2( 1,  0),
+    int2( 0,  1),
+    int2( 0, -1),
+    int2(-1,  1),
+    int2( 1,  1),
+    int2( 1, -1),
+    int2(-1, -1),
+};
+
+groupshared float4 SharedColor[LDS_ARRAY_SIZE];
+
+// Get the index within the LDS array.
+uint GetTileArrayIndexFromPixelOffset(in uint2 GroupThreadId, in int2 PixelOffset)
+{
+    uint2 TilePos = GroupThreadId + uint2(PixelOffset + LDS_TILE_BORDER_SIZE);
+    return TilePos.x + TilePos.y * (LDS_TILE_BORDER_SIZE * 2 + TILE_SIZE);
+}
+
+float4 SampleCachedColors(in uint2 GroupThreadId, int2 PixelOffset = int2(0,0))
+{
+    return SharedColor[GetTileArrayIndexFromPixelOffset(GroupThreadId, PixelOffset)];
+}
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+    uint2 GroupId : SV_GroupID,
+    uint2 GroupThreadId : SV_GroupThreadID,
+    uint GroupThreadIndex : SV_GroupIndex,
+    uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+    // Init LDS
+    {
+        // Global texel coordinate of the active group (corner) offset by the LDS border
+        uint2 GroupTexelOffset = GroupId * uint2(TILE_SIZE, TILE_SIZE) - LDS_TILE_BORDER_SIZE;
+
+        // To account for the dilation margin, each warp thread should load extra texels.
+        // We proceed linearly through the tile (with borders) and each warp thread loads
+        // multiple colors at THREADGROUP_TOTAL intervals with the necessary boundary conditions.
+        const uint LoadCount = (LDS_ARRAY_SIZE + THREADGROUP_TOTAL - 1) / THREADGROUP_TOTAL; // integer ceiling
+
+        uint LinearGroupThreadId = GroupThreadIndex;
+
+        UNROLL
+        for (uint i = 0; i < LoadCount; i++)
+        {
+            uint2 TexelLocation =  GroupTexelOffset + uint2(
+                LinearGroupThreadId % LDS_TILE_WIDTH,
+                LinearGroupThreadId / LDS_TILE_WIDTH);
+
+            if ((LinearGroupThreadId < LDS_ARRAY_SIZE) ||
+                (i != LoadCount - 1) ||
+                (LDS_ARRAY_SIZE % THREADGROUP_TOTAL) == 0)
+            {
+                SharedColor[LinearGroupThreadId] = InputTexture[TexelLocation];
+            }
+            LinearGroupThreadId += THREADGROUP_TOTAL;
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Discard out-of-bound texels
+    if (any(DispatchThreadId >= Dimensions))
+    {
+        return;
+    }
+
+    float4 TexelColor = SampleCachedColors(GroupThreadId);
+    
+    BRANCH
+    if(TexelColor.a > ALPHA_THRESHOLD) // Alpha is inverted opacity
+    {
+        UNROLL
+        for(int i=0; i<KERNEL_COUNT; i++)
+        {
+            float4 OffsetColor = SampleCachedColors(GroupThreadId, kOffsets[i]);
+
+            if(OffsetColor.a < TexelColor.a)
+            {
+                TexelColor = OffsetColor;
+            }
+        }
+    }
+
+    RWOutputTexture[DispatchThreadId] = TexelColor;
+}

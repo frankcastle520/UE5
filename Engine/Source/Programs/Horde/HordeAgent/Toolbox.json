@@ -1,0 +1,17 @@
+{
+	"manualInstall": true,
+	"installCommand": {
+		"fileName": "msiexec.exe",
+		"arguments": [
+			"/i",
+			"UnrealHordeAgent.msi"
+		]
+	},
+	"uninstallCommand": {
+		"fileName": "msiexec.exe",
+		"arguments": [
+			"/x",
+			"UnrealHordeAgent.msi"
+		]
+	}
+}

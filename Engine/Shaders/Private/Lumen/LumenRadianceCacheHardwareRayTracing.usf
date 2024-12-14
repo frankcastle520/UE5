@@ -1,0 +1,653 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Shared/RayTracingTypes.h"
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../MortonCode.ush"
+#include "../SceneTextureParameters.ush"
+#include "../RayTracing/RayGenUtils.ush"
+#include "LumenRadianceCacheCommon.ush"
+#include "LumenRadianceCacheTracingCommon.ush"
+#include "LumenCardCommon.ush"
+#include "LumenCardTile.ush"
+#include "LumenTracingCommon.ush"
+
+// Must match LumenRadianceCache::TRACE_TILE_ATLAS_STRITE_IN_TILES in LumenRadianceCacheInternal.h
+#define TRACE_TILE_ATLAS_STRITE_IN_TILES 512
+
+#define RAY_TRACING_PASS_DEFAULT		0
+#define RAY_TRACING_PASS_FAR_FIELD		1
+#define RAY_TRACING_PASS_HIT_LIGHTING	2
+
+float MinTraceDistance;
+float MaxTraceDistance;
+
+// Index into temporary compacted atlas of probe traces
+uint2 GetTraceTileAtlasCoord(uint TraceTileIndex, uint2 CoordInTraceTile)
+{
+	uint2 TraceAtlasCoord = (RADIANCE_CACHE_TRACE_TILE_SIZE_2D * uint2(TraceTileIndex % TRACE_TILE_ATLAS_STRITE_IN_TILES, TraceTileIndex / TRACE_TILE_ATLAS_STRITE_IN_TILES)) + CoordInTraceTile;
+	return TraceAtlasCoord;
+}
+
+float EncodeRayDistance(float HitDistance, bool bHit)
+{
+	HitDistance = max(HitDistance, 0.0f);
+	return HitDistance * (bHit ? -1.0f : 1.0f);
+}
+
+struct FRayDistance
+{
+	float HitDistance;
+	bool bHit;
+};
+
+FRayDistance DecodeRayDistance(float Encoded)
+{
+	FRayDistance RayDistance;
+	RayDistance.bHit = asuint(Encoded) & 0x80000000;
+	RayDistance.HitDistance = abs(Encoded);
+	return RayDistance;
+}
+
+uint EncodeRadianceCacheTraceTexel(uint TraceTileIndex, uint2 TraceTexelCoord)
+{
+	uint Encoded = TraceTileIndex & 0xFFFFFF;
+	Encoded |= (TraceTexelCoord.x << 24);
+	Encoded |= (TraceTexelCoord.y << 28);
+	return Encoded;
+}
+
+void DecodeRadianceCacheTraceTexel(uint Encoded, inout uint TraceTileIndex, inout uint2 TraceTexelCoord)
+{
+	TraceTileIndex = Encoded & 0xFFFFFF;
+	TraceTexelCoord.x = (Encoded >> 24) & 0xF;
+	TraceTexelCoord.y = (Encoded >> 28) & 0xF;
+}
+
+Buffer<uint> CompactedTraceTexelAllocator_0;
+Buffer<uint> CompactedTraceTexelData_0;
+
+#if RADIANCE_CACHE_BATCH_SIZE > 1
+	Buffer<uint> CompactedTraceTexelAllocator_1;
+	Buffer<uint> CompactedTraceTexelData_1;
+#endif
+
+RWBuffer<uint> RWHardwareRayTracingIndirectArgs;
+RWBuffer<uint> RWResolveIndirectArgs;
+uint2 OutputThreadGroupSize;
+uint TempAtlasNumTraceTiles;
+
+#ifdef LumenRadianceCacheHardwareRayTracingIndirectArgsCS
+[numthreads(1, 1, 1)]
+void LumenRadianceCacheHardwareRayTracingIndirectArgsCS()
+{
+	uint NumRays = CompactedTraceTexelAllocator_0[0];
+	#if RADIANCE_CACHE_BATCH_SIZE > 1
+	{
+		NumRays += CompactedTraceTexelAllocator_1[0];
+	}
+	#endif
+
+	uint NumGroups = (NumRays + OutputThreadGroupSize.x - 1) / OutputThreadGroupSize.x;
+	int3 IndirectArgs = GetRayTracingThreadCountWrapped(NumGroups, RADIANCE_CACHE_TRACE_TILE_SIZE_1D);
+	WriteDispatchIndirectArgs(RWHardwareRayTracingIndirectArgs, 0, IndirectArgs);
+
+	#if RESOLVE_INDIRECT_ARGS
+	{
+		// Run one group per 8x8 tile (must match RADIANCE_CACHE_TRACE_TILE_SIZE_2D)
+		WriteDispatchIndirectArgs(RWResolveIndirectArgs, 0, DivideAndRoundUp64(NumRays), 1, 1);
+	}
+	#endif
+}
+#endif
+
+Buffer<float4> RadianceCache_0_ProbeTraceData;
+Buffer<uint2> RadianceCache_0_ProbeTraceTileData;
+Buffer<uint> RadianceCache_0_ProbeTraceTileAllocator;
+Buffer<uint> RadianceCache_0_CompactedTraceTexelAllocator;
+Buffer<uint> RadianceCache_0_CompactedTraceTexelData;
+uint RadianceCache_0_RadianceProbeResolution;
+uint RadianceCache_0_ProbeAtlasResolutionModuloMask;
+uint RadianceCache_0_ProbeAtlasResolutionDivideShift;
+float4 RadianceCache_0_RadianceProbeSettings[RADIANCE_PROBE_MAX_CLIPMAPS];
+uint RadianceCache_0_FarField;
+
+#if RADIANCE_CACHE_BATCH_SIZE > 1
+	Buffer<float4> RadianceCache_1_ProbeTraceData;
+	Buffer<uint2> RadianceCache_1_ProbeTraceTileData;
+	Buffer<uint> RadianceCache_1_ProbeTraceTileAllocator;
+	Buffer<uint> RadianceCache_1_CompactedTraceTexelAllocator;
+	Buffer<uint> RadianceCache_1_CompactedTraceTexelData;
+	uint RadianceCache_1_RadianceProbeResolution;
+	uint RadianceCache_1_ProbeAtlasResolutionModuloMask;
+	uint RadianceCache_1_ProbeAtlasResolutionDivideShift;
+	float4 RadianceCache_1_RadianceProbeSettings[RADIANCE_PROBE_MAX_CLIPMAPS];
+	uint RadianceCache_1_FarField;
+#endif
+
+struct FRadianceCache
+{
+	uint2 TraceTileCoord;
+	uint TraceTileLevel;
+	uint ProbeTraceIndex;
+
+	float3 ProbeWorldCenter;
+	uint ClipmapIndex;
+	uint ProbeIndex;
+
+	uint ProbeResolution;
+	float ProbeTMin;
+	uint ProbeAtlasResolutionModuloMask;
+	uint ProbeAtlasResolutionDivideShift;
+
+	bool bFarField;
+};
+
+FRadianceCache LoadRadianceCache(uint RadianceCacheIndex, uint LocalTraceTileIndex)
+{
+	FRadianceCache RadianceCache;
+
+	#if RADIANCE_CACHE_BATCH_SIZE > 1
+	if (RadianceCacheIndex == 1)
+	{
+		UnpackTraceTileInfo(RadianceCache_1_ProbeTraceTileData[LocalTraceTileIndex], RadianceCache.TraceTileCoord, RadianceCache.TraceTileLevel, RadianceCache.ProbeTraceIndex);	
+		GetProbeTraceData(RadianceCache_1_ProbeTraceData[RadianceCache.ProbeTraceIndex], RadianceCache.ProbeWorldCenter, RadianceCache.ClipmapIndex, RadianceCache.ProbeIndex);
+		RadianceCache.ProbeTMin = RadianceCache_1_RadianceProbeSettings[RadianceCache.ClipmapIndex].x;
+		RadianceCache.ProbeResolution = RadianceCache_1_RadianceProbeResolution;
+		RadianceCache.ProbeAtlasResolutionModuloMask = RadianceCache_1_ProbeAtlasResolutionModuloMask;
+		RadianceCache.ProbeAtlasResolutionDivideShift = RadianceCache_1_ProbeAtlasResolutionDivideShift;
+		RadianceCache.bFarField = RadianceCache_1_FarField != 0;
+	}
+	else
+	#endif
+	{
+		UnpackTraceTileInfo(RadianceCache_0_ProbeTraceTileData[LocalTraceTileIndex], RadianceCache.TraceTileCoord, RadianceCache.TraceTileLevel, RadianceCache.ProbeTraceIndex);	
+		GetProbeTraceData(RadianceCache_0_ProbeTraceData[RadianceCache.ProbeTraceIndex], RadianceCache.ProbeWorldCenter, RadianceCache.ClipmapIndex, RadianceCache.ProbeIndex);
+		RadianceCache.ProbeTMin = RadianceCache_0_RadianceProbeSettings[RadianceCache.ClipmapIndex].x;
+		RadianceCache.ProbeResolution = RadianceCache_0_RadianceProbeResolution;
+		RadianceCache.ProbeAtlasResolutionModuloMask = RadianceCache_0_ProbeAtlasResolutionModuloMask;
+		RadianceCache.ProbeAtlasResolutionDivideShift = RadianceCache_0_ProbeAtlasResolutionDivideShift;
+		RadianceCache.bFarField = RadianceCache_0_FarField != 0;
+	}
+
+	return RadianceCache;
+}
+
+#if LUMEN_HARDWARE_RAYTRACING || LUMEN_HARDWARE_INLINE_RAYTRACING
+
+#include "LumenHardwareRayTracingCommon.ush"
+
+RaytracingAccelerationStructure TLAS;
+
+#if LUMEN_HARDWARE_INLINE_RAYTRACING
+	StructuredBuffer<FHitGroupRootConstants> HitGroupData;
+	StructuredBuffer<FRayTracingSceneMetadataRecord> RayTracingSceneMetadata;
+#endif // LUMEN_HARDWARE_INLINE_RAYTRACING
+
+uint HitLightingShadowMode;
+uint HitLightingDirectLighting;
+uint HitLightingSkylight;
+float NearFieldSceneRadius;
+float NearFieldMaxTraceDistance;
+float FarFieldBias;
+float FarFieldMaxTraceDistance;
+float PullbackBias;
+uint MaxTraversalIterations;
+uint MeshSectionVisibilityTest;
+float3 FarFieldReferencePos;
+
+RWTexture2D<float3> RWTraceRadianceTexture;
+RWTexture2D<float> RWTraceHitTexture;
+
+void TraceRadianceCacheProbeTexel(
+	uint RadianceCacheIndex,
+	uint LocalTraceTileIndex,
+	uint GlobalTraceTileIndex,
+	uint2 TexelCoord,
+	float TraceHitDistance)
+{
+	FRadianceCache RadianceCache = LoadRadianceCache(RadianceCacheIndex, LocalTraceTileIndex);
+
+	uint TraceResolution = (RadianceCache.ProbeResolution / 2) << RadianceCache.TraceTileLevel;
+	uint2 ProbeTexelCoord = RadianceCache.TraceTileCoord * RADIANCE_CACHE_TRACE_TILE_SIZE_2D + TexelCoord;
+
+	if (all(ProbeTexelCoord < TraceResolution))
+	{
+		float2 ProbeTexelCenter = float2(0.5, 0.5);
+		float2 ProbeUV = (ProbeTexelCoord + ProbeTexelCenter) / float(TraceResolution);
+		float3 WorldConeDirection = EquiAreaSphericalMapping(ProbeUV);
+
+		// Evenly distributing the sphere solid angle among all cones instead of based on Octahedron distortion
+		float ConeHalfAngle = acosFast(1.0f - 1.0f / (float)(TraceResolution * TraceResolution));
+
+		FRayDesc Ray;
+		Ray.Origin = RadianceCache.ProbeWorldCenter + DFHackToFloat(PrimaryView.PreViewTranslation); // LUMEN_LWC_TODO
+		Ray.Direction = WorldConeDirection;
+
+		float ClippedNearFieldMaxTraceDistance = ClipAndDitherNearFieldMaxTraceDistance(
+			Ray.Origin,
+			Ray.Direction,
+			ProbeTexelCoord,
+			NearFieldSceneRadius,
+			NearFieldMaxTraceDistance,
+			/*NearFieldMaxTraceDistanceDitherScale*/ 0.0f);
+
+		Ray.TMin = max(max(MinTraceDistance, RadianceCache.ProbeTMin), TraceHitDistance - PullbackBias);
+		Ray.TMax = max(ClippedNearFieldMaxTraceDistance - PullbackBias, Ray.TMin);
+		#if ENABLE_FAR_FIELD_TRACING
+		{
+			Ray.TMin = max(Ray.TMin, FarFieldBias);
+		}
+		#endif
+
+		FRayCone RayCone = (FRayCone)0;
+		RayCone = PropagateRayCone(RayCone, ConeHalfAngle, 0.0);
+
+		const uint LinearCoord = ProbeTexelCoord.y * RADIANCE_CACHE_TRACE_TILE_SIZE_2D + ProbeTexelCoord.x;
+
+		FRayTracedLightingContext Context = CreateRayTracedLightingContext(
+			RayCone,
+			ProbeTexelCoord,
+			LinearCoord,
+			/*CullingMode*/ RAY_FLAG_NONE, // Disable culling in order to minimize leaking when rays start inside walls
+			MaxTraversalIterations,
+			MeshSectionVisibilityTest != 0);
+
+		// Set far-field context specialization
+		Context.FarFieldMaxTraceDistance = FarFieldMaxTraceDistance;
+		Context.FarFieldReferencePos = FarFieldReferencePos;
+		#if LUMEN_HARDWARE_INLINE_RAYTRACING
+		{
+			Context.HitGroupData = HitGroupData;
+			Context.RayTracingSceneMetadata = RayTracingSceneMetadata;
+		}
+		#endif
+
+		FRayTracedLightingResult Result = CreateRayTracedLightingResult();
+		#if RAY_TRACING_PASS == RAY_TRACING_PASS_HIT_LIGHTING
+		{
+			Context.bHitLightingDirectLighting = HitLightingDirectLighting != 0;
+			Context.bHitLightingSkylight = HitLightingSkylight != 0;
+			Context.bUseReflectionCaptures = false;
+			Context.HitLightingShadowMode = HitLightingShadowMode;
+			Context.HitLightingShadowMaxTraceDistance = NearFieldMaxTraceDistance;
+			
+			Result = TraceAndCalculateRayTracedLighting(TLAS, Ray, Context);
+		}
+		#else
+		{
+			Result = TraceAndCalculateRayTracedLightingFromSurfaceCache(TLAS, Ray, Context);
+		}
+		#endif
+
+		if (!Result.bIsHit)
+		{
+			FConeTraceResult TraceResult = (FConeTraceResult)0;
+			TraceResult.Transparency = 1;
+			ApplySkylightToTraceResult(Ray.Direction, TraceResult);
+			Result.Radiance = TraceResult.Lighting;
+		}
+
+		#define DEBUG_VISUALIZE_SAMPLING_RESOLUTION 0
+		#if DEBUG_VISUALIZE_SAMPLING_RESOLUTION
+			// Set r.Lumen.RadianceCache.SpatialFilterProbes 0 for raw output
+			Result.Radiance = TraceTileLevel == 0 ? float3(0, 1, 0) : (TraceTileLevel == 1 ? float3(1, 0, 0) : float3(1, 0, 1));
+		#endif
+
+		if (GlobalTraceTileIndex < TempAtlasNumTraceTiles)
+		{
+			uint2 TraceAtlasCoord = GetTraceTileAtlasCoord(GlobalTraceTileIndex, TexelCoord);
+			RWTraceRadianceTexture[TraceAtlasCoord] = Result.Radiance;
+			RWTraceHitTexture[TraceAtlasCoord] = EncodeRayDistance(min(Result.TraceHitDistance, MaxHalfFloat), Result.bIsHit);
+		}
+	}
+}
+
+// RADIANCE_CACHE_TRACE_TILE_SIZE_1D thread groups
+void LumenRadianceCacheHardwareRayTracingCommon(uint GroupId, uint GroupThreadId)
+{
+	#if RAY_TRACING_PASS == RAY_TRACING_PASS_DEFAULT || RAY_TRACING_PASS == RAY_TRACING_PASS_HIT_LIGHTING
+	{
+		// Loop over all trace tiles and trace a ray
+
+		uint GlobalTraceTileIndex = GroupId;
+		uint MaxLocalTraceTileIndex = RadianceCache_0_ProbeTraceTileAllocator[0];
+
+		uint RadianceCacheIndex	= 0;
+		uint LocalTraceTileIndex = GroupId;
+
+		#if RADIANCE_CACHE_BATCH_SIZE == 2
+		{
+			// Select which radiance cache should be updated in this wave
+			if (GlobalTraceTileIndex >= MaxLocalTraceTileIndex)
+			{
+				RadianceCacheIndex = 1;
+				LocalTraceTileIndex = GlobalTraceTileIndex - MaxLocalTraceTileIndex;
+				MaxLocalTraceTileIndex = RadianceCache_1_ProbeTraceTileAllocator[0];
+			}
+		}
+		#endif
+
+		if (LocalTraceTileIndex < MaxLocalTraceTileIndex)
+		{
+			uint2 TexelCoord = uint2(GroupThreadId % RADIANCE_CACHE_TRACE_TILE_SIZE_2D, GroupThreadId / RADIANCE_CACHE_TRACE_TILE_SIZE_2D);
+			
+			TraceRadianceCacheProbeTexel(
+				RadianceCacheIndex,
+				LocalTraceTileIndex,
+				GlobalTraceTileIndex,
+				TexelCoord,
+				/*TraceHitDistance*/ 0.0f);
+		}
+	}
+	#elif RAY_TRACING_PASS == RAY_TRACING_PASS_FAR_FIELD
+	{
+		// Loop over all compacted texels and trace a ray
+		uint GlobalCompactedTraceIndex = GroupId * RADIANCE_CACHE_TRACE_TILE_SIZE_1D + GroupThreadId;
+		uint LocalCompactedTraceIndex = GlobalCompactedTraceIndex;
+		uint MaxLocalCompactedTraceIndex = RadianceCache_0_CompactedTraceTexelAllocator[0];
+		uint RadianceCacheIndex = 0;
+
+		#if RADIANCE_CACHE_BATCH_SIZE == 2
+		{
+			// Select which radiance cache should be updated in this thread
+			if (GlobalCompactedTraceIndex >= MaxLocalCompactedTraceIndex)
+			{
+				RadianceCacheIndex = 1;
+				LocalCompactedTraceIndex = GlobalCompactedTraceIndex - MaxLocalCompactedTraceIndex;
+				MaxLocalCompactedTraceIndex = RadianceCache_1_CompactedTraceTexelAllocator[0];
+			}
+		}
+		#endif
+
+		if (LocalCompactedTraceIndex < MaxLocalCompactedTraceIndex)
+		{
+			uint2 TexelCoord = uint2(GroupThreadId % RADIANCE_CACHE_TRACE_TILE_SIZE_2D, GroupThreadId / RADIANCE_CACHE_TRACE_TILE_SIZE_2D);
+			uint GlobalTraceTileIndex = 0;
+			uint LocalTraceTileIndex = 0;
+
+			#if RADIANCE_CACHE_BATCH_SIZE == 2
+			if (RadianceCacheIndex == 1)
+			{
+				DecodeRadianceCacheTraceTexel(RadianceCache_1_CompactedTraceTexelData[LocalCompactedTraceIndex], GlobalTraceTileIndex, TexelCoord);
+				LocalTraceTileIndex = GlobalTraceTileIndex - RadianceCache_0_ProbeTraceTileAllocator[0];
+			}
+			else
+			#endif
+			{
+				DecodeRadianceCacheTraceTexel(RadianceCache_0_CompactedTraceTexelData[LocalCompactedTraceIndex], GlobalTraceTileIndex, TexelCoord);
+				LocalTraceTileIndex = GlobalTraceTileIndex;
+			}
+
+			uint2 TraceAtlasCoord = GetTraceTileAtlasCoord(GlobalTraceTileIndex, TexelCoord);
+			float TraceHitDistance = DecodeRayDistance(RWTraceHitTexture[TraceAtlasCoord].x).HitDistance;			
+
+			TraceRadianceCacheProbeTexel(
+				RadianceCacheIndex,
+				LocalTraceTileIndex,
+				GlobalTraceTileIndex,
+				TexelCoord,
+				TraceHitDistance);			
+		}
+	}
+	#endif
+
+}
+
+#if LUMEN_HARDWARE_INLINE_RAYTRACING
+
+#ifdef LumenRadianceCacheHardwareRayTracingCS
+[numthreads(INLINE_RAY_TRACING_THREAD_GROUP_SIZE_X, INLINE_RAY_TRACING_THREAD_GROUP_SIZE_Y, 1)]
+void LumenRadianceCacheHardwareRayTracingCS(
+	uint3 GroupId : SV_GroupID,
+	uint GroupIndex : SV_GroupIndex
+)
+{
+	uint GroupLinearIndex = GetUnWrappedRayTracingDispatchThreadId(GroupId, RADIANCE_CACHE_TRACE_TILE_SIZE_1D);
+	uint ThreadIndex = GroupLinearIndex * INLINE_RAY_TRACING_THREAD_GROUP_SIZE_X + GroupIndex;
+
+	LumenRadianceCacheHardwareRayTracingCommon(
+		ThreadIndex / RADIANCE_CACHE_TRACE_TILE_SIZE_1D,
+		ThreadIndex % RADIANCE_CACHE_TRACE_TILE_SIZE_1D);
+}
+#endif
+
+#else // LUMEN_HARDWARE_RAYTRACING
+
+#ifdef LumenRadianceCacheHardwareRayTracingRGS
+RAY_TRACING_ENTRY_RAYGEN(LumenRadianceCacheHardwareRayTracingRGS)
+{
+	uint ThreadIndex = GetUnWrappedRayTracingDispatchThreadId(DispatchRaysIndex(), RADIANCE_CACHE_TRACE_TILE_SIZE_1D);
+
+	LumenRadianceCacheHardwareRayTracingCommon(
+		ThreadIndex / RADIANCE_CACHE_TRACE_TILE_SIZE_1D,
+		ThreadIndex % RADIANCE_CACHE_TRACE_TILE_SIZE_1D);
+}
+#endif
+
+#endif // LUMEN_HARDWARE_INLINE_RAYTRACING
+
+#endif // LUMEN_HARDWARE_RAYTRACING
+
+Texture2D<float3> TraceRadianceTexture;
+Texture2D<float> TraceHitTexture;
+
+#ifdef RadianceCacheCompactTracesCS
+
+RWBuffer<uint> RWCompactedTraceTexelAllocator_0;
+RWBuffer<uint> RWCompactedTraceTexelData_0;
+
+#if RADIANCE_CACHE_BATCH_SIZE > 1
+	RWBuffer<uint> RWCompactedTraceTexelAllocator_1;
+	RWBuffer<uint> RWCompactedTraceTexelData_1;
+#endif
+
+groupshared uint SharedTraceTexelAllocator;
+groupshared uint SharedGlobalTraceTexelStartOffset;
+groupshared uint SharedTraceTexels[RADIANCE_CACHE_TRACE_TILE_SIZE_2D * RADIANCE_CACHE_TRACE_TILE_SIZE_2D];
+
+/**
+ * Compact all unfinished traces for the subsequent far field pass.
+ */
+[numthreads(RADIANCE_CACHE_TRACE_TILE_SIZE_2D, RADIANCE_CACHE_TRACE_TILE_SIZE_2D, 1)]
+void RadianceCacheCompactTracesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint GlobalTraceTileIndex = GroupId.x;
+	uint MaxLocalTraceTileIndex = RadianceCache_0_ProbeTraceTileAllocator[0];
+
+	uint RadianceCacheIndex	= 0;
+	uint LocalTraceTileIndex = GroupId.x;
+
+	#if RADIANCE_CACHE_BATCH_SIZE == 2
+	{
+		// Select which radiance cache should be updated in this wave
+		if (GlobalTraceTileIndex >= MaxLocalTraceTileIndex)
+		{
+			RadianceCacheIndex = 1;
+			LocalTraceTileIndex = GlobalTraceTileIndex - MaxLocalTraceTileIndex;
+			MaxLocalTraceTileIndex = RadianceCache_1_ProbeTraceTileAllocator[0];
+		}
+	}
+	#endif
+
+	SharedTraceTexelAllocator = 0;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LocalTraceTileIndex < MaxLocalTraceTileIndex)
+	{
+		FRadianceCache RadianceCache = LoadRadianceCache(RadianceCacheIndex, LocalTraceTileIndex);
+
+		uint TraceResolution = (RadianceCache.ProbeResolution / 2) << RadianceCache.TraceTileLevel;
+		uint2 ProbeTexelCoord = RadianceCache.TraceTileCoord * RADIANCE_CACHE_TRACE_TILE_SIZE_2D + GroupThreadId.xy;
+
+		if (RadianceCache.bFarField && all(ProbeTexelCoord < TraceResolution))
+		{
+			const uint2 RadianceTextureCoord = GetTraceTileAtlasCoord(GlobalTraceTileIndex, GroupThreadId.xy);
+			const bool bHit = DecodeRayDistance(TraceHitTexture[RadianceTextureCoord].x).bHit;
+
+			if (!bHit)
+			{
+				uint SharedTexelOffset;
+				InterlockedAdd(SharedTraceTexelAllocator, 1, SharedTexelOffset);
+				SharedTraceTexels[SharedTexelOffset] = EncodeRadianceCacheTraceTexel(GlobalTraceTileIndex, GroupThreadId.xy);
+			}
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint ThreadIndex = GroupThreadId.y * RADIANCE_CACHE_TRACE_TILE_SIZE_2D + GroupThreadId.x;
+
+	if (ThreadIndex == 0)
+	{
+		#if RADIANCE_CACHE_BATCH_SIZE > 1
+		if (RadianceCacheIndex == 1)
+		{
+			InterlockedAdd(RWCompactedTraceTexelAllocator_1[0], SharedTraceTexelAllocator, SharedGlobalTraceTexelStartOffset);
+		}
+		else
+		#endif
+		{
+			InterlockedAdd(RWCompactedTraceTexelAllocator_0[0], SharedTraceTexelAllocator, SharedGlobalTraceTexelStartOffset);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (ThreadIndex < SharedTraceTexelAllocator)
+	{
+		#if RADIANCE_CACHE_BATCH_SIZE > 1
+		if (RadianceCacheIndex == 1)
+		{
+			RWCompactedTraceTexelData_1[SharedGlobalTraceTexelStartOffset + ThreadIndex] = SharedTraceTexels[ThreadIndex];
+		}
+		else
+		#endif
+		{
+			RWCompactedTraceTexelData_0[SharedGlobalTraceTexelStartOffset + ThreadIndex] = SharedTraceTexels[ThreadIndex];
+		}
+	}
+}
+#endif
+
+#ifdef SplatRadianceCacheIntoAtlasCS
+
+RWTexture2D<float3> RWRadianceProbeAtlasTexture_0;
+RWTexture2D<float> RWDepthProbeAtlasTexture_0;
+
+#if RADIANCE_CACHE_BATCH_SIZE > 1
+	RWTexture2D<float3> RWRadianceProbeAtlasTexture_1;
+	RWTexture2D<float> RWDepthProbeAtlasTexture_1;
+#endif
+
+[numthreads(RADIANCE_CACHE_TRACE_TILE_SIZE_2D, RADIANCE_CACHE_TRACE_TILE_SIZE_2D, 1)]
+void SplatRadianceCacheIntoAtlasCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID
+)
+{
+	uint GlobalTraceTileIndex = GroupId.x;
+	uint MaxLocalTraceTileIndex = RadianceCache_0_ProbeTraceTileAllocator[0];
+
+	uint RadianceCacheIndex	= 0;
+	uint LocalTraceTileIndex = GroupId.x;
+
+	#if RADIANCE_CACHE_BATCH_SIZE == 2
+	{
+		// Select which radiance cache should be updated in this wave
+		if (GlobalTraceTileIndex >= MaxLocalTraceTileIndex)
+		{
+			RadianceCacheIndex = 1;
+			LocalTraceTileIndex = GlobalTraceTileIndex - MaxLocalTraceTileIndex;
+			MaxLocalTraceTileIndex = RadianceCache_1_ProbeTraceTileAllocator[0];
+		}
+	}
+	#endif
+
+	if (LocalTraceTileIndex < MaxLocalTraceTileIndex)
+	{
+		FRadianceCache RadianceCache = LoadRadianceCache(RadianceCacheIndex, LocalTraceTileIndex);
+	
+		uint TraceResolution = (RadianceCache.ProbeResolution / 2) << RadianceCache.TraceTileLevel;
+		uint2 ProbeAtlasBaseCoord = RadianceCache.ProbeResolution * uint2(RadianceCache.ProbeIndex & RadianceCache.ProbeAtlasResolutionModuloMask, RadianceCache.ProbeIndex >> RadianceCache.ProbeAtlasResolutionDivideShift);
+
+		if (TraceResolution < RadianceCache.ProbeResolution)
+		{
+			uint UpsampleFactor = RadianceCache.ProbeResolution / TraceResolution;
+			ProbeAtlasBaseCoord += (RADIANCE_CACHE_TRACE_TILE_SIZE_2D * RadianceCache.TraceTileCoord + GroupThreadId.xy) * UpsampleFactor;
+
+			float3 Lighting = 0.0f;
+			float HitDistance = MaxHalfFloat;
+
+			if (GlobalTraceTileIndex < TempAtlasNumTraceTiles)
+			{
+				const uint2 RadianceTextureCoord = GetTraceTileAtlasCoord(GlobalTraceTileIndex, GroupThreadId.xy);
+				Lighting = TraceRadianceTexture[RadianceTextureCoord].xyz;
+				HitDistance = DecodeRayDistance(TraceHitTexture[RadianceTextureCoord].x).HitDistance;
+			}
+
+			for (uint Y = 0; Y < UpsampleFactor; Y++)
+			{
+				for (uint X = 0; X < UpsampleFactor; X++)
+				{
+					#if RADIANCE_CACHE_BATCH_SIZE == 2
+					if (RadianceCacheIndex == 1)
+					{
+						RWRadianceProbeAtlasTexture_1[ProbeAtlasBaseCoord + uint2(X, Y)] = Lighting;
+						RWDepthProbeAtlasTexture_1[ProbeAtlasBaseCoord + uint2(X, Y)] = HitDistance;
+					}
+					else
+					#endif
+					{
+						RWRadianceProbeAtlasTexture_0[ProbeAtlasBaseCoord + uint2(X, Y)] = Lighting;
+						RWDepthProbeAtlasTexture_0[ProbeAtlasBaseCoord + uint2(X, Y)] = HitDistance;
+					}
+				}
+			}
+		}
+		else
+		{
+			uint DownsampleFactor = TraceResolution / RadianceCache.ProbeResolution;
+			uint WriteTileSize = RADIANCE_CACHE_TRACE_TILE_SIZE_2D / DownsampleFactor;
+
+			if (all(GroupThreadId.xy < WriteTileSize))
+			{
+				float3 Lighting = 0;
+				float HitDistance = MaxHalfFloat;
+
+				for (uint Y = 0; Y < DownsampleFactor; Y++)
+				{
+					for (uint X = 0; X < DownsampleFactor; X++)
+					{
+						if (GlobalTraceTileIndex < TempAtlasNumTraceTiles)
+						{
+							const uint2 RadianceTextureCoord = GetTraceTileAtlasCoord(GlobalTraceTileIndex, uint2(GroupThreadId.x * DownsampleFactor + X, GroupThreadId.y * DownsampleFactor + Y));
+							Lighting += TraceRadianceTexture[RadianceTextureCoord].xyz;
+							HitDistance = min(HitDistance, DecodeRayDistance(TraceHitTexture[RadianceTextureCoord].x).HitDistance);
+						}
+					}
+				}
+
+				uint2 ProbeAtlasCoord = ProbeAtlasBaseCoord + WriteTileSize * RadianceCache.TraceTileCoord + GroupThreadId.xy;
+
+				#if RADIANCE_CACHE_BATCH_SIZE == 2
+				if (RadianceCacheIndex == 1)
+				{
+					RWRadianceProbeAtlasTexture_1[ProbeAtlasCoord] = Lighting / (float)(DownsampleFactor * DownsampleFactor);
+					RWDepthProbeAtlasTexture_1[ProbeAtlasCoord] = HitDistance;
+				}
+				else
+				#endif
+				{
+					RWRadianceProbeAtlasTexture_0[ProbeAtlasCoord] = Lighting / (float)(DownsampleFactor * DownsampleFactor);
+					RWDepthProbeAtlasTexture_0[ProbeAtlasCoord] = HitDistance;
+				}
+			}
+		}
+	}
+}
+#endif

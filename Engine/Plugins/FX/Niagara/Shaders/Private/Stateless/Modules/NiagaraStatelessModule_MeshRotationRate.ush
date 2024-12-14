@@ -1,0 +1,20 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../NiagaraStatelessCommon.ush"
+
+int	MeshRotationRate_ModuleEnabled;
+float3	MeshRotationRate_Scale;
+float3	MeshRotationRate_Bias;
+
+void MeshRotationRate_Simulate(inout FStatelessParticle Particle)
+{
+	if ( MeshRotationRate_ModuleEnabled == 0 )
+	{
+		return;
+	}
+	const float3 RotationRate = RandomScaleBiasFloat(0, MeshRotationRate_Scale, MeshRotationRate_Bias);
+
+	Particle.MeshOrientation			= MultiplyQuat(Particle.MeshOrientation,			RotatorToQuat(Particle.Age * RotationRate));
+	Particle.PreviousMeshOrientation	= MultiplyQuat(Particle.PreviousMeshOrientation,	RotatorToQuat(Particle.PreviousAge * RotationRate));
+}
+

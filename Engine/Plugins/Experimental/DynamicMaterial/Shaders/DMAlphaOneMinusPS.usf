@@ -1,0 +1,17 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+
+// Shader to apply 1-x to the alpha channel
+void MainPS(
+	noperspective float4 UVAndScreenPos : TEXCOORD0,
+	out float4 OutColor : SV_Target0
+)
+{
+	float2 UV = UVAndScreenPos.xy;
+	OutColor = InputTexture.Sample(InputSampler, UV);
+	OutColor.a = 1.f - OutColor.a;
+}

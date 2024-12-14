@@ -1,0 +1,28 @@
+{
+	"FileVersion": 1,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Trace Data Filtering (Deprecated)",
+	"Description": "Allows for turning on/off individual or sets of Trace Channels. The plugin is deprecated because the functionality has been moved to the Trace Control Widget from Session Frontend and the Live Trace Control Widget from Unreal Insights.",
+	"Category": "Insights",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"SupportedPrograms": [ "UnrealInsights" ],
+	"Modules": [
+		{
+			"Name": "TraceDataFiltering",
+			"Type": "EditorAndProgram",
+			"LoadingPhase": "PreDefault",
+			"ProgramAllowList": [
+				"UnrealInsights"
+			]
+		}
+	]
+}

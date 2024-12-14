@@ -1,0 +1,9 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+/** Record passed to shader bundle work graph nodes .*/
+struct FShaderBundleNodeRecord
+{
+	uint DispatchGridSize : SV_DispatchGrid;
+};

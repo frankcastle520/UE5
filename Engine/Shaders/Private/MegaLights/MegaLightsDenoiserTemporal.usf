@@ -1,0 +1,444 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// When loading SSS checkerboard pixel, do not adjust DiffuseColor/SpecularColor to preserve specular and diffuse lighting values for each pixel
+#define ALLOW_SSS_MATERIAL_OVERRIDE 0
+
+#include "../Common.ush"
+#include "MegaLightsShading.ush"
+#include "../Lumen/LumenReflectionDenoiserCommon.ush"
+#include "../StochasticLighting/StochasticLightingCommon.ush"
+
+// Improves performance on certain platforms
+#if !DEBUG_MODE && VALID_HISTORY
+	MAX_OCCUPANCY
+#endif
+
+Texture2D ResolvedDiffuseLighting;
+Texture2D ResolvedSpecularLighting;
+Texture2D<UNORM float> ShadingConfidenceTexture;
+Texture2D MegaLightsDepthHistory;
+Texture2D<float4> MegaLightsNormalAndShading;
+Texture2D DiffuseLightingAndSecondMomentHistoryTexture;
+Texture2D SpecularLightingAndSecondMomentHistoryTexture;
+Texture2D<UNORM float> NumFramesAccumulatedHistoryTexture;
+
+float4 HistoryScreenPositionScaleBias;
+float4 HistoryUVMinMax;
+float4 HistoryGatherUVMinMax;
+float PrevSceneColorPreExposureCorrection;
+float MinFramesAccumulatedForHistoryMiss;
+float MinFramesAccumulatedForHighConfidence;
+float TemporalMaxFramesAccumulated;
+float TemporalNeighborhoodClampScale;
+
+RWTexture2D<float4> RWDiffuseLightingAndSecondMoment;
+RWTexture2D<float4> RWSpecularLightingAndSecondMoment;
+RWTexture2D<UNORM float> RWNumFramesAccumulated;
+
+struct FNeighborhood
+{
+	float3 Center;
+	float3 Extent;
+};
+
+#define SHARED_TILE_BORDER 2
+#define SHARED_TILE_SIZE (8 + 2 * SHARED_TILE_BORDER)
+groupshared uint3 SharedResolvedLightingYCoCg[SHARED_TILE_SIZE][SHARED_TILE_SIZE];
+
+uint3 PackDiffuseAndSpecular(float3 Diffuse, float3 Specular)
+{
+	uint3 V;
+	V.x = (f32tof16(Diffuse.x) << 16) | f32tof16(Diffuse.y);
+	V.y = (f32tof16(Diffuse.z) << 16) | f32tof16(Specular.x);
+	V.z = (f32tof16(Specular.y) << 16) | f32tof16(Specular.z);
+	return V;
+}
+
+half3 UnpackDiffuse(uint3 V)
+{
+	half3 Diffuse;
+	Diffuse.x = f16tof32(V.x >> 16);
+	Diffuse.y = f16tof32(V.x & 0xFFFF);
+	Diffuse.z = f16tof32(V.y >> 16);
+	return Diffuse;
+}
+
+float3 UnpackSpecular(uint3 V)
+{
+	half3 Specular;
+	Specular.x = f16tof32(V.y & 0xFFFF);
+	Specular.y = f16tof32(V.z >> 16);
+	Specular.z = f16tof32(V.z & 0xFFFF);
+	return Specular;
+}
+
+// Compute local neighborhood statistics
+void GetNeighborhood(uint2 LocalCoord, float3 DiffuseCenterSample, float3 SpecularCenterSample, inout FNeighborhood DiffuseNeighborhood, inout FNeighborhood SpecularNeighborhood, inout FDebug Debug)
+{
+	DiffuseCenterSample = LumenRGBToYCoCg(DiffuseCenterSample);
+	SpecularCenterSample = LumenRGBToYCoCg(SpecularCenterSample);
+
+	half DiffuseWeightSum = 1.0f;
+	half3 DiffuseSampleSum = DiffuseCenterSample;
+	half3 DiffuseSampleSqSum = Pow2(DiffuseCenterSample);
+
+	half SpecularWeightSum = 1.0f;
+	half3 SpecularSampleSum = SpecularCenterSample;
+	half3 SpecularSampleSqSum = Pow2(SpecularCenterSample);
+
+	const int KernelSize = 2;
+	for (int NeigborOffsetY = -KernelSize; NeigborOffsetY <= KernelSize; ++NeigborOffsetY)
+	{
+		for (int NeigborOffsetX = -KernelSize; NeigborOffsetX <= KernelSize; ++NeigborOffsetX)
+		{
+			const bool bCenter = NeigborOffsetX == 0 && NeigborOffsetY == 0;
+			const bool bCorner = abs(NeigborOffsetX) == KernelSize && abs(NeigborOffsetY) == KernelSize;
+
+			// Skip center as it's already accounted for
+			// Also optimize it a bit by skipping corners
+			if (!bCenter && !bCorner)
+			{
+				uint3 PackedLighting = SharedResolvedLightingYCoCg[SHARED_TILE_BORDER + LocalCoord.x + NeigborOffsetX][SHARED_TILE_BORDER + LocalCoord.y + NeigborOffsetY];
+				half3 DiffuseNeigbor = UnpackDiffuse(PackedLighting);
+				half3 SpecularNeigbor = UnpackSpecular(PackedLighting);
+				
+				if (IsLightingValid(DiffuseNeigbor))
+				{
+					DiffuseSampleSum += DiffuseNeigbor;
+					DiffuseSampleSqSum += Pow2(DiffuseNeigbor);
+					DiffuseWeightSum += 1.0f;
+				}
+
+				if (IsLightingValid(SpecularNeigbor))
+				{
+					SpecularSampleSum += SpecularNeigbor;
+					SpecularSampleSqSum += Pow2(SpecularNeigbor);
+					SpecularWeightSum += 1.0f;
+				}
+			}
+		}
+	}
+
+	float3 M1 = DiffuseSampleSum / DiffuseWeightSum;
+	float3 M2 = DiffuseSampleSqSum / DiffuseWeightSum;
+	float3 Variance = max(M2 - Pow2(M1), 0.0f);
+	float3 StdDev = sqrt(Variance);
+	
+	DiffuseNeighborhood = (FNeighborhood)0;
+	DiffuseNeighborhood.Center = M1;
+	DiffuseNeighborhood.Extent = TemporalNeighborhoodClampScale * StdDev;
+
+	M1 = SpecularSampleSum / SpecularWeightSum;
+	M2 = SpecularSampleSqSum / SpecularWeightSum;
+	Variance = max(M2 - Pow2(M1), 0.0f);
+	StdDev = sqrt(Variance);
+	
+	SpecularNeighborhood = (FNeighborhood)0;
+	SpecularNeighborhood.Center = M1;
+	SpecularNeighborhood.Extent = TemporalNeighborhoodClampScale * StdDev;
+}
+
+float3 ClampLuminance(float3 Lighting, float LuminanceClamp)
+{
+	if (Luminance(Lighting) > LuminanceClamp)
+	{
+		Lighting *= LuminanceClamp / Luminance(Lighting);
+	}
+
+	return Lighting;
+}
+
+float ShadingConfidenceWeight(float ShadingConfidence)
+{
+	// #ml_todo: expose as CVars
+	float Edge0 = 0.75f;
+	float Edge1 = 0.25f;
+	return saturate((ShadingConfidence - Edge0) / (Edge1 - Edge0));
+}
+
+/**
+ * Temporal accumulation of shaded light samples
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DenoiserTemporalCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 ScreenCoord = DispatchThreadId.xy + View.ViewRectMinAndSize.xy;
+
+	FDebug Debug;
+#if DEBUG_MODE
+	int2 DebugScreenCoord = GetDebugScreenCoord();
+	Debug.bActive = all(ScreenCoord == DebugScreenCoord);
+	Debug.Context = InitShaderPrintContext(true, float2(0.55, 0.55));
+#endif
+
+	// Load resolved diffuse and specular neighborhood into shared memory
+	for (uint SharedCoordY = GroupThreadId.y; SharedCoordY < SHARED_TILE_SIZE; SharedCoordY += THREADGROUP_SIZE)
+	{
+		for (uint SharedCoordX = GroupThreadId.x; SharedCoordX < SHARED_TILE_SIZE; SharedCoordX += THREADGROUP_SIZE)
+		{
+			int2 ResolvedCoord = GroupId.xy * THREADGROUP_SIZE + View.ViewRectMinAndSize.xy + int2(SharedCoordX, SharedCoordY) - SHARED_TILE_BORDER;
+			
+			float3 ResolvedDiffuseYCoCg = INVALID_LIGHTING;
+			float3 ResolvedSpecularYCoCg = INVALID_LIGHTING;
+
+			// Skip corners as they will be also skiped in GetNeighborhood()
+			const bool bCorner = (SharedCoordX == 0 || SharedCoordX + 1 == SHARED_TILE_SIZE) && (SharedCoordY == 0 || SharedCoordY + 1 == SHARED_TILE_SIZE);
+			if (!bCorner && all(ResolvedCoord.xy >= View.ViewRectMinAndSize.xy) && all(ResolvedCoord.xy < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+			{
+				float3 DiffuseSample = ResolvedDiffuseLighting[ResolvedCoord].xyz;
+				float3 SpecularSample = ResolvedSpecularLighting[ResolvedCoord].xyz;
+
+				if (IsLightingValid(DiffuseSample))
+				{
+					ResolvedDiffuseYCoCg = LumenRGBToYCoCg(DiffuseSample);
+				}
+
+				if (IsLightingValid(SpecularSample))
+				{
+					ResolvedSpecularYCoCg = LumenRGBToYCoCg(SpecularSample);
+				}
+			}
+
+			SharedResolvedLightingYCoCg[SharedCoordX][SharedCoordY] = PackDiffuseAndSpecular(ResolvedDiffuseYCoCg, ResolvedSpecularYCoCg);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (all(ScreenCoord < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+	{
+		float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+		FMegaLightsMaterial Material = LoadMaterial(ScreenUV, ScreenCoord);
+
+		const float DeviceZ = SceneDepthTexture[ScreenCoord].x;
+		Material.SetDepth(ConvertFromDeviceZ(DeviceZ));
+
+		uint3 PackedLighting = SharedResolvedLightingYCoCg[GroupThreadId.x + SHARED_TILE_BORDER][GroupThreadId.y + SHARED_TILE_BORDER];
+		float3 DiffuseLighting = UnpackDiffuse(PackedLighting);
+		float3 SpecularLighting = UnpackSpecular(PackedLighting);
+		float DiffuseSecondMoment = 0.0f;
+		float SpecularSecondMoment = 0.0f;
+		float NumFramesAccumulated = 0.0f;
+
+		float ShadingConfidence = ShadingConfidenceTexture[ScreenCoord];
+
+		#if DEBUG_MODE
+		if (Debug.bActive)
+		{
+			Print(Debug.Context, TEXT("TemporalAccumulation"), FontTitle);
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("ScreenCoord         : "));
+			Print(Debug.Context, ScreenCoord.x, FontValue);
+			Print(Debug.Context, ScreenCoord.y, FontValue);
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("CenterDiffuse       : "));
+			Print(Debug.Context, DiffuseLighting, FontValue);
+			Newline(Debug.Context);
+			Print(Debug.Context, TEXT("CenterSpecular      : "));
+			Print(Debug.Context, SpecularLighting, FontValue);
+		}
+		#endif
+
+		if (IsLightingValid(DiffuseLighting))
+		{
+			if (IsLightingValid(DiffuseLighting))
+			{
+				DiffuseLighting = LumenYCoCgToRGB(DiffuseLighting);
+				DiffuseSecondMoment = Pow2(Luminance(DiffuseLighting));
+			}
+
+			if (IsLightingValid(SpecularLighting))
+			{
+				SpecularLighting = LumenYCoCgToRGB(SpecularLighting);
+				SpecularSecondMoment = Pow2(Luminance(SpecularLighting));
+			}
+
+			#if VALID_HISTORY
+			{
+				float2 ScreenPosition = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+				float3 HistoryScreenPosition = GetHistoryScreenPosition(ScreenPosition, ScreenUV, DeviceZ);
+				float2 HistoryScreenUV = HistoryScreenPosition.xy * HistoryScreenPositionScaleBias.xy + HistoryScreenPositionScaleBias.wz;
+
+				bool bHistoryWasOnScreen = all(HistoryScreenUV >= HistoryUVMinMax.xy) && all(HistoryScreenUV <= HistoryUVMinMax.zw);
+				if (bHistoryWasOnScreen)
+				{
+					HistoryScreenUV = clamp(HistoryScreenUV, HistoryGatherUVMinMax.xy, HistoryGatherUVMinMax.zw);
+
+					uint2 HistoryScreenCoord = floor(HistoryScreenUV * View.BufferSizeAndInvSize.xy - 0.5f);
+					float2 HistoryBilinearWeights = frac(HistoryScreenUV * View.BufferSizeAndInvSize.xy - 0.5f);
+					float2 HistoryGatherUV = (HistoryScreenCoord + 1.0f) * View.BufferSizeAndInvSize.zw;
+
+					float4 HistorySampleSceneDepth4 = MegaLightsDepthHistory.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+					HistorySampleSceneDepth4.x = ConvertFromDeviceZ(HistorySampleSceneDepth4.x);
+					HistorySampleSceneDepth4.y = ConvertFromDeviceZ(HistorySampleSceneDepth4.y);
+					HistorySampleSceneDepth4.z = ConvertFromDeviceZ(HistorySampleSceneDepth4.z);
+					HistorySampleSceneDepth4.w = ConvertFromDeviceZ(HistorySampleSceneDepth4.w);
+
+					// #ml_todo: plane weighting
+					float ReprojectedSceneDepth = ConvertFromDeviceZ(HistoryScreenPosition.z);
+					float DisocclusionDistanceThreshold = 0.03f;
+					const float4 DistanceToHistoryValue = abs(HistorySampleSceneDepth4 - ReprojectedSceneDepth);
+					float4 DepthWeights = select(DistanceToHistoryValue >= ReprojectedSceneDepth * DisocclusionDistanceThreshold, 0.0f, 1.0f);
+
+					float4 HistoryWeights = float4(
+						(1 - HistoryBilinearWeights.y) * (1 - HistoryBilinearWeights.x),
+						(1 - HistoryBilinearWeights.y) * HistoryBilinearWeights.x,
+						HistoryBilinearWeights.y * (1 - HistoryBilinearWeights.x),
+						HistoryBilinearWeights.y * HistoryBilinearWeights.x);
+
+					HistoryWeights *= DepthWeights;
+
+					// If shading info history is available, used it to only fetch compatible pixels.
+					// For now only hair pixel are filtered out as their shading model is too different from the others
+					{
+						const float4 PackedW = MegaLightsNormalAndShading.GatherAlpha(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+
+						const bool4 bIsHair4 = bool4(
+							UnpackNormalAndShadingInfo(float4(0,0,0,PackedW.x)).bIsHair,
+							UnpackNormalAndShadingInfo(float4(0,0,0,PackedW.y)).bIsHair,
+							UnpackNormalAndShadingInfo(float4(0,0,0,PackedW.z)).bIsHair,
+							UnpackNormalAndShadingInfo(float4(0,0,0,PackedW.w)).bIsHair);
+						const float4 ShadingInfoWeights = select(Material.bIsHair.xxxx == bIsHair4, 1.f, 0.f);
+
+						HistoryWeights *= ShadingInfoWeights;
+					}
+
+					#if DEBUG_MODE	
+					if (Debug.bActive)
+					{
+						Newline(Debug.Context);
+						Print(Debug.Context, TEXT("DepthWeights        : "));
+						Print(Debug.Context, DepthWeights, FontValue);
+						Newline(Debug.Context);
+						Print(Debug.Context, TEXT("HistoryWeights      : "));
+						Print(Debug.Context, HistoryWeights, FontValue);
+					}
+					#endif
+
+					// Use history only if we found at least one valid sample
+					if (any(HistoryWeights > 0.01f))
+					{
+						float4 DiffuseLightingAndSecondMomentHistory = 0.0f;
+						DiffuseLightingAndSecondMomentHistory.x = dot(DiffuseLightingAndSecondMomentHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingAndSecondMomentHistory.y = dot(DiffuseLightingAndSecondMomentHistoryTexture.GatherGreen(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingAndSecondMomentHistory.z = dot(DiffuseLightingAndSecondMomentHistoryTexture.GatherBlue(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingAndSecondMomentHistory.w = dot(DiffuseLightingAndSecondMomentHistoryTexture.GatherAlpha(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingAndSecondMomentHistory = DiffuseLightingAndSecondMomentHistory / dot(HistoryWeights, 1.0f);
+
+						float4 SpecularLightingAndSecondMomentHistory = 0.0f;
+						SpecularLightingAndSecondMomentHistory.x = dot(SpecularLightingAndSecondMomentHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingAndSecondMomentHistory.y = dot(SpecularLightingAndSecondMomentHistoryTexture.GatherGreen(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingAndSecondMomentHistory.z = dot(SpecularLightingAndSecondMomentHistoryTexture.GatherBlue(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingAndSecondMomentHistory.w = dot(SpecularLightingAndSecondMomentHistoryTexture.GatherAlpha(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingAndSecondMomentHistory = SpecularLightingAndSecondMomentHistory / dot(HistoryWeights, 1.0f);
+
+						// Correct history for current frame exposure
+						float3 HistoryDiffuseLighting = DiffuseLightingAndSecondMomentHistory.xyz * PrevSceneColorPreExposureCorrection;
+						float HistoryDiffuseSecondMoment = DiffuseLightingAndSecondMomentHistory.w * Pow2(PrevSceneColorPreExposureCorrection);
+						float3 HistorySpecularLighting = SpecularLightingAndSecondMomentHistory.xyz * PrevSceneColorPreExposureCorrection;
+						float HistorySpecularSecondMoment = SpecularLightingAndSecondMomentHistory.w * Pow2(PrevSceneColorPreExposureCorrection);
+
+						FNeighborhood DiffuseNeighborhood;
+						FNeighborhood SpecularNeighborhood;
+						GetNeighborhood(GroupThreadId.xy, DiffuseLighting, SpecularLighting, DiffuseNeighborhood, SpecularNeighborhood, Debug);
+
+						// Clamp diffuse history
+						float DiffuseConfidence = 1.0f;
+						float3 ClampedHistoryDiffuseLighting = HistoryDiffuseLighting;
+						{
+							HistoryDiffuseLighting = LumenRGBToYCoCg(HistoryDiffuseLighting);
+							ClampedHistoryDiffuseLighting = clamp(HistoryDiffuseLighting, DiffuseNeighborhood.Center - DiffuseNeighborhood.Extent, DiffuseNeighborhood.Center + DiffuseNeighborhood.Extent);
+
+							// Speedup accumulation if history is far away from the current neighborhood
+							float NormalizedDistanceToNeighborhood = length(abs(ClampedHistoryDiffuseLighting - HistoryDiffuseLighting) / max(DiffuseNeighborhood.Extent, 0.1f));
+							DiffuseConfidence = saturate(1.0f - NormalizedDistanceToNeighborhood);
+
+							ClampedHistoryDiffuseLighting = LumenYCoCgToRGB(ClampedHistoryDiffuseLighting);
+						}
+
+						// Clamp specular history
+						float SpecularConfidence = 1.0f;
+						float3 ClampedHistorySpecularLighting = HistorySpecularLighting;
+						{
+							HistorySpecularLighting = LumenRGBToYCoCg(HistorySpecularLighting);						
+							ClampedHistorySpecularLighting = clamp(HistorySpecularLighting, SpecularNeighborhood.Center - SpecularNeighborhood.Extent, SpecularNeighborhood.Center + SpecularNeighborhood.Extent);
+
+							// Speedup accumulation if history is far away from the current neighborhood
+							float NormalizedDistanceToNeighborhood = length(abs(ClampedHistorySpecularLighting - HistorySpecularLighting) / max(SpecularNeighborhood.Extent, 0.1f));
+							SpecularConfidence = saturate(1.0f - NormalizedDistanceToNeighborhood);
+
+							ClampedHistorySpecularLighting = LumenYCoCgToRGB(ClampedHistorySpecularLighting);
+						}
+
+						// #ml_todo: clamp also the second moment
+						float ClampedHistoryDiffuseSecondMoment = max(HistoryDiffuseSecondMoment, 0.0f);
+						float ClampedHistorySpecularSecondMoment = max(HistorySpecularSecondMoment, 0.0f);
+
+						// Reproject and rescale normalized NumFramesAccumulated
+						float NumFramesAccumulatedHistory = 0.0f;
+						NumFramesAccumulatedHistory = UnpackNumFramesAccumulated(dot(NumFramesAccumulatedHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights) / dot(HistoryWeights, 1.0f));
+						
+						float MaxConfidenceFrames = lerp(MinFramesAccumulatedForHighConfidence, TemporalMaxFramesAccumulated, ShadingConfidenceWeight(ShadingConfidence));
+						float MaxDiffuseFrames = min(lerp(MinFramesAccumulatedForHistoryMiss, TemporalMaxFramesAccumulated, DiffuseConfidence), MaxConfidenceFrames);
+						float MaxSpecularFrames = min(lerp(MinFramesAccumulatedForHistoryMiss, TemporalMaxFramesAccumulated, SpecularConfidence), MaxConfidenceFrames);
+
+						// Advance the frame counter
+						float DiffuseNumFramesAccumulated = min(NumFramesAccumulatedHistory + 1.0f, MaxDiffuseFrames);
+						float SpecularNumFramesAccumulated = min(NumFramesAccumulatedHistory + 1.0f, MaxSpecularFrames);
+						NumFramesAccumulated = lerp(DiffuseNumFramesAccumulated, SpecularNumFramesAccumulated, 0.5f);
+
+						// Blend history with new samples
+						float DiffuseAlpha = 1.0f / DiffuseNumFramesAccumulated;
+						DiffuseLighting = lerp(ClampedHistoryDiffuseLighting, DiffuseLighting, DiffuseAlpha);
+						DiffuseSecondMoment = lerp(ClampedHistoryDiffuseSecondMoment, DiffuseSecondMoment, DiffuseAlpha);
+
+						float SpecularAlpha = 1.0f / SpecularNumFramesAccumulated;
+						SpecularLighting = lerp(ClampedHistorySpecularLighting, SpecularLighting, SpecularAlpha);
+						SpecularSecondMoment = lerp(ClampedHistorySpecularSecondMoment, SpecularSecondMoment, SpecularAlpha);
+
+						DiffuseLighting = MakeFinite(DiffuseLighting);
+						SpecularLighting = MakeFinite(SpecularLighting);
+
+						#if DEBUG_MODE
+						if (Debug.bActive)
+						{
+							float DiffuseVariance = max(DiffuseSecondMoment - Pow2(Luminance(DiffuseLighting)), 0.0f);
+							float SpecularVariance = max(SpecularSecondMoment - Pow2(Luminance(SpecularLighting)), 0.0f);
+
+							Newline(Debug.Context);
+							Print(Debug.Context, TEXT("NumFramesAccumulated: "));
+							Print(Debug.Context, NumFramesAccumulated, FontValue);
+							Newline(Debug.Context);
+							Print(Debug.Context, TEXT("DiffuseVariance     : "));
+							Print(Debug.Context, DiffuseVariance, FontValue);
+							Newline(Debug.Context);
+							Print(Debug.Context, TEXT("SpecularVariance    : "));
+							Print(Debug.Context, SpecularVariance, FontValue);
+							Newline(Debug.Context);
+							Print(Debug.Context, TEXT("Diffuse             : "));
+							Print(Debug.Context, DiffuseLighting, FontValue);
+							Print(Debug.Context, Luminance(DiffuseLighting), FontValue);
+							Newline(Debug.Context);
+							Print(Debug.Context, TEXT("Specular            : "));
+							Print(Debug.Context, SpecularLighting, FontValue);
+							Print(Debug.Context, Luminance(SpecularLighting), FontValue);
+							Newline(Debug.Context);
+							Print(Debug.Context, TEXT("Confidence          : "));
+							Print(Debug.Context, DiffuseConfidence, FontValue);
+							Print(Debug.Context, SpecularConfidence, FontValue);
+						}
+						#endif
+					}
+				}
+			}
+			#endif
+		}
+
+		RWDiffuseLightingAndSecondMoment[ScreenCoord] = float4(DiffuseLighting, DiffuseSecondMoment);
+		RWSpecularLightingAndSecondMoment[ScreenCoord] = float4(SpecularLighting, SpecularSecondMoment);
+		RWNumFramesAccumulated[ScreenCoord] = PackNumFramesAccumulated(NumFramesAccumulated);
+	}
+}

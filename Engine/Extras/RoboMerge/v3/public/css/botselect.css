@@ -1,0 +1,96 @@
+/* Copyright Epic Games, Inc. All Rights Reserved. */
+
+details.botselect {
+    border: 1px solid #767676;
+    border-radius: 3px;
+    display: inline-flex;
+    flex-direction: column;
+    padding: 3px 6px;
+    z-index:100;
+    float: inline-start;
+
+    position: fixed;
+    overflow: hidden;
+
+    background-color: white;
+
+    -webkit-transition: all 0.5s ease-in-out;
+    -moz-transition: all 0.5s ease-in-out;
+    -ms-transition: all 0.5s ease-in-out;
+    -o-transition: all 0.5s ease-in-out;
+    transition: all 0.5s ease-in-out;
+  }
+  
+  details.botselect summary::marker {
+    display: none;
+    font-size: 0;
+  }
+  
+  details.botselect summary::-webkit-details-marker {
+    display: none;
+    font-size: 0;
+  }
+  
+  details.botselect summary::after {
+    content: "\25BC" / "";
+    display: inline-block;
+    font-size: 0.6rem;
+    height: 1rem;
+    line-height: 1rem;
+    margin-left: 0.5rem;
+    position: relative;
+    transition: transform 0.25s;
+    }
+  
+  details[open] .botselect summary {
+    margin-bottom: 1rem;
+  }
+  
+  details[open] .botselect summary::after {
+    top: -0.15rem;
+    transform: rotate(180deg);
+  }
+  
+  details.botselect form {
+    display: flex;
+  }
+  
+  details.botselect fieldset {
+    border: 0;
+    padding: 0;
+    width: 100%;
+  }
+  
+  details.botselect fieldset legend {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+  }
+  
+  details.botselect fieldset ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  
+  details.botselect fieldset  ul li {
+    border-radius: 3px;
+    margin: 0;
+    padding: 4px 2px;
+  }
+  
+  details.botselect fieldset ul li:hover {
+    background: #eee;
+  }
+  
+  details.botselect fieldset ul li label {
+    display: flex;
+    flex-grow: 1;
+    justify-content: space-between;
+  }

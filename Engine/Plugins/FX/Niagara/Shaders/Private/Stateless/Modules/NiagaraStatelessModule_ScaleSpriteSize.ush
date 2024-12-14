@@ -1,0 +1,20 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../NiagaraStatelessCommon.ush"
+
+FNiagaraStatelessBuiltDistributionType	ScaleSpriteSize_Distribution;
+float2	ScaleSpriteSize_CurveScale;
+
+void ScaleSpriteSize_Simulate(inout FStatelessParticle Particle)
+{
+	FStatelessDistributionSamplerFloat2 ScaleDistribution;
+	ScaleDistribution.Init(0, ScaleSpriteSize_Distribution);
+
+	if (ScaleDistribution.IsValid())
+	{
+		const float2 ScaleFactor = ScaleSpriteSize_CurveScale;
+
+		Particle.SpriteSize			*= ScaleDistribution.GetValue(Particle.NormalizedAge) * ScaleFactor;
+		Particle.PreviousSpriteSize	*= ScaleDistribution.GetValue(Particle.PreviousNormalizedAge) * ScaleFactor;
+	}
+}

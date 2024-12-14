@@ -1,0 +1,32 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+#include "WaveOpUtil.ush"
+
+#ifdef OVERRIDE_SHADERBUNDLE_USH
+#include "/Platform/Private/ShaderBundle.ush"
+#include "/Engine/Public/RootConstants.ush"
+
+uint GetRecordCount()   { return GetAllRootConstants().x; }
+uint3 GetPlatformData() { return GetAllRootConstants().yzw; }
+
+ByteAddressBuffer RecordArgBuffer;
+ByteAddressBuffer RecordDataBuffer;
+RWByteAddressBuffer RWExecutionBuffer;
+
+#endif
+
+[numthreads(THREADGROUP_SIZEX, 1, 1)]
+void DispatchShaderBundleEntry(uint RecordIndex : SV_DispatchThreadID) 
+{
+#ifdef OVERRIDE_SHADERBUNDLE_USH
+	// Note: Make sure the process record call is not under flow control
+	ProcessShaderBundleRecord(
+		GetPlatformData(),
+		RecordIndex,
+		GetRecordCount(),
+		RecordArgBuffer,
+		RecordDataBuffer,
+		RWExecutionBuffer);
+#endif
+}

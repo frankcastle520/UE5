@@ -1,0 +1,128 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Shared/RayTracingTypes.h"
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../MortonCode.ush"
+#include "../SceneTextureParameters.ush"
+#include "LumenCardCommon.ush"
+#include "LumenTracingCommon.ush"
+//#include "LumenReflectionCommon.ush"
+
+#ifndef LUMEN_HARDWARE_RAYTRACING
+#define LUMEN_HARDWARE_RAYTRACING 0
+#endif // LUMEN_HARDWARE_RAYTRACING
+
+#ifndef LUMEN_HARDWARE_INLINE_RAYTRACING
+#define LUMEN_HARDWARE_INLINE_RAYTRACING 0
+#endif // LUMEN_HARDWARE_INLINE_RAYTRACING
+
+#if LUMEN_HARDWARE_RAYTRACING || LUMEN_HARDWARE_INLINE_RAYTRACING
+#include "LumenHardwareRayTracingCommon.ush"
+#endif // LUMEN_HARDWARE_RAYTRACING || LUMEN_HARDWARE_INLINE_RAYTRACING
+
+#include "LumenCardTile.ush"
+#include "../ShaderPrint.ush"
+
+#if LUMEN_HARDWARE_RAYTRACING || LUMEN_HARDWARE_INLINE_RAYTRACING
+
+RaytracingAccelerationStructure TLAS;
+
+#if LUMEN_HARDWARE_INLINE_RAYTRACING
+	StructuredBuffer<FHitGroupRootConstants> HitGroupData;
+	StructuredBuffer<FRayTracingSceneMetadataRecord> RayTracingSceneMetadata;
+
+	FLumenTraceRayInlineCallback InitLumenTraceRayInlineCallback()
+	{
+		FLumenTraceRayInlineCallback Callback;
+		Callback.HitGroupData = HitGroupData;
+		Callback.bShadowRay = true;
+		return Callback;
+	}
+#endif // LUMEN_HARDWARE_INLINE_RAYTRACING
+
+#if SHADER_DEBUG_SCENE
+
+float ResolutionScale;
+RWStructuredBuffer<uint> RWDebugData;
+
+LUMEN_HARDWARE_RAY_TRACING_ENTRY(LumenSceneDebugHardwareRayTracing)
+{
+	ResolvedView = ResolveView();
+	if (all(DispatchThreadIndex == 0))
+	{
+		FShaderPrintContext Ctx = InitShaderPrintContext(true, uint2(800, 50));
+		const int2 PixelCoord = int2(ResolutionScale * GetCursorPos(Ctx));
+		if (all(PixelCoord >= 0))
+		{
+			const float2 BufferUV = (PixelCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+			FRayDesc Ray = CreatePrimaryRay(BufferUV);
+
+			FRayCone RayCone = (FRayCone)0;
+			uint2 DummyCoordInCardTile = 0;
+			uint MaxTraversalIterations = 1;
+			uint MeshSectionVisibilityTest = 0;
+			FRayTracedLightingContext Context = CreateRayTracedLightingContext(
+				RayCone,
+				DummyCoordInCardTile,
+				DummyCoordInCardTile.x, // dummy coordinate
+				RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+				MaxTraversalIterations,
+				MeshSectionVisibilityTest != 0);
+
+			Context.bAcceptFirstHitAndEndSearch = true;
+			Context.InstanceMask = RAY_TRACING_MASK_OPAQUE;
+			Context.bIsShadowRay = false;
+
+			#if LUMEN_HARDWARE_INLINE_RAYTRACING
+			{
+				Context.HitGroupData = HitGroupData;
+				Context.RayTracingSceneMetadata = RayTracingSceneMetadata;
+			}
+			#endif
+
+			FLumenMinimalRayResult Result = TraceLumenMinimalRay(TLAS, Ray, Context);
+			if (Result.bHit)
+			{
+				float Epsilon = 0.01f;
+				const float3 TranslatedWorldSpacePosition = Ray.Origin + Ray.Direction * Result.HitT + Result.HitNormal * Epsilon;
+				const float3 AbsoluteWorldSpacePosition = TranslatedWorldSpacePosition - DFHackToFloat(PrimaryView.PreViewTranslation);
+				const float3 WorldSpaceNormal = Result.HitNormal;
+				const uint MeshCardsIndex = GetMeshCardsIndexFromSceneInstanceIndex(Result.SceneInstanceIndex);
+				
+				FCardSampleAccumulator CardSampleAccumulator;
+				InitCardSampleAccumulator(CardSampleAccumulator);
+				SampleLumenMeshCards(
+					MeshCardsIndex, 
+					AbsoluteWorldSpacePosition, 
+					WorldSpaceNormal, 
+					10.f  /*SampleRadius*/,
+					20.0f /*SurfaceCacheBias*/,
+					false /*bHiResSurface*/,
+					CardSampleAccumulator);
+
+				FLumenSceneDebugData OutDebugData = InitLumenSceneDebugData();
+				if (CardSampleAccumulator.CardSample.bValid)
+				{
+					OutDebugData.MeshIndex = MeshCardsIndex;
+					OutDebugData.CardIndex = CardSampleAccumulator.CardSample.CardIndex;
+					OutDebugData.CardPageIndex = CardSampleAccumulator.CardSample.CardPageIndex;
+					OutDebugData.PhysicalAtlasUV = CardSampleAccumulator.CardSample.PhysicalAtlasUV;
+				}
+				WriteDebugData(OutDebugData, RWDebugData);
+
+				// Intersection detail
+				#if 0
+				const float3 RayStart = Ray.Origin + Ray.Direction * Ray.TMin;
+				const float3 RayEnd = Ray.Origin + Ray.Direction * (Result.bHit ? Result.HitT : Ray.TMax);
+				AddLineTWS(Ctx, RayStart, RayEnd, ColorGreen);
+				AddCrossTWS(Ctx, TranslatedWorldSpacePosition, 30.f, ColorRed);
+				AddLineTWS(Ctx, RayEnd, RayEnd + WorldSpaceNormal * 100.f, ColorBlue);
+				#endif
+			}
+		}
+	}
+}
+#endif // SHADER_DEBUG_SCENE
+
+#endif // LUMEN_HARDWARE_RAYTRACING

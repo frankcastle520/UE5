@@ -1,0 +1,5 @@
+# EditorConfig is awesome: http://EditorConfig.org
+
+# Settings for this module
+[*]
+indent_style = tab

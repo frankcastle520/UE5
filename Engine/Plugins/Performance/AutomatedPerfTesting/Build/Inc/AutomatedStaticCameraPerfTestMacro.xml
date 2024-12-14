@@ -1,0 +1,38 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../../../../../Engine/Build/Graph/Schema.xsd" >
+
+	<Macro Name="AutomatedStaticCameraPerfTestNode">
+		<!-- Run the test. No 'Requires' as we run on the same machine locally and use the publish folder otherwise -->
+		<Node Name="$(TestNodeName)" Requires="$(TestPrerequisites)" Annotations="$(NodeAnnotations)">
+			<Command Name="RunUnreal" Arguments="-project=$(TargetProject) -test=&quot;$(TestName)&quot; -platform=$(TargetPlatform) -configuration=$(TestConfiguration) -target=$(TargetName) $(GauntletBuildArg) $(GauntletTestArgs) $(GauntletReportArgs) $(AdditionalArguments) $(MapNameArgument)"/>
+		</Node>
+	</Macro>
+	
+	<Macro Name="AutomatedStaticCameraPerfTest" Arguments="TestName;MapNames;AdditionalArguments">
+		<ForEach Name="MapName" Values="$(MapNames)" Separator="+">
+			<Property Name="TestNameTitle" Value="$(TestName)"/>
+			<Expand Name="SanitizeTestNameTitle"/>
+			
+			<!-- Run and report on the test-->
+			<Do If="'$(AutomationReportOutputDirectory)' != ''">
+				<Property Name="OutputFragmentPath" Value="$(TargetPlatform)/$(TestConfiguration)/$(TestNameTitle)" />
+				<Property Name="OutputReportPath" Value="$(AutomationReportOutputDirectory)/$(OutputFragmentPath)" />
+				<Property Name="GauntletReportArgs" Value="-logdir=&quot;$(OutputReportPath)&quot; -artifactname=Gauntlet -ReportExportPath=&quot;$(OutputReportPath)&quot;" />
+				<Property Name="GauntletReportArgs" Value="$(GauntletReportArgs) -ReportURL=&quot;$(AutomationReportUrl)/$(OutputFragmentPath)/&quot;" If="'$(AutomationReportUrl)' != ''" />
+			</Do>
+			<Property Name="TestNodeName" Value="$(PreNodeName)$(TargetPlatform) $(TestConfiguration) $(TestNameTitle) $(MapName)" />
+			<Property Name="NodeAnnotations" Value=""/>
+			<Property Name="NodeAnnotations" Value="Workflow=$(AnnotationsTarget)" If="ContainsItem('$(AnnotationsPlatforms)', '$(TargetPlatform)', ';') and ContainsItem('$(AnnotationsTests)', '$(TestName)', ';')"/>
+			
+			<Property Name="MapNameArgument" Value="-AutomatedPerfTest.StaticCameraPerfTest.MapName=$(MapName)" />
+			
+			<Expand Name="AutomatedStaticCameraPerfTestNode" />
+
+			<!-- Add it to our list -->
+			<Do If="!ContainsItem('$(TargetPlatformsToSkipTests)', '$(TargetPlatform)', '+')">
+				<Property Name="AllPlatformTestNodes" Value="$(AllPlatformTestNodes);$(TestNodeName)"/>
+			</Do>
+		</ForEach>
+	</Macro>
+	
+</BuildGraph>

@@ -1,0 +1,244 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LumenCardSceneLightingDebug.usf
+=============================================================================*/
+
+#include "../Common.ush"
+#include "../ShaderPrint.ush"
+#include "LumenCardCommon.ush"
+#include "LumenCardTile.ush"
+#include "LumenSceneLighting.ush"
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_STATS
+uint LightingStatMode;
+StructuredBuffer<uint> PriorityHistogram;
+StructuredBuffer<uint> MaxUpdateBucket;
+StructuredBuffer<uint> CardPageTileAllocator;
+StructuredBuffer<uint> DirectLightingCardPageIndexAllocator;
+StructuredBuffer<uint> IndirectLightingCardPageIndexAllocator;
+
+void LumenSceneLightingStats(uint CardUpdateContext, StructuredBuffer<uint> CardPageIndexAllocator)
+{
+	FShaderPrintContext Context = InitShaderPrintContext(true, float2(0.1, 0.1));
+	Newline(Context);
+
+	LOOP
+	for (uint BucketIndex = 0; BucketIndex < PRIORITY_HISTOGRAM_SIZE; ++BucketIndex)
+	{
+		Print(Context, PriorityHistogram[CardUpdateContext * PRIORITY_HISTOGRAM_SIZE + BucketIndex]);
+
+		if ((BucketIndex + 1) % 8 == 0)
+		{
+			Newline(Context);
+		}
+		else
+		{
+			PrintSymbol(Context, _SPC_);
+		}
+	}
+
+	const uint MaxUpdateBucketIndex = MaxUpdateBucket[MAX_UPDATE_BUCKET_STRIDE * CardUpdateContext + 0];
+	const uint MaxTilesFromMaxUpdateBucket = MaxUpdateBucket[MAX_UPDATE_BUCKET_STRIDE * CardUpdateContext + 1];
+
+	Newline(Context);
+	Print(Context, TEXT("MaxBucket "));
+	Print(Context, MaxUpdateBucketIndex);
+
+	Newline(Context);
+	Print(Context, TEXT("MaxTilesFromMaxBucket "));
+	Print(Context, MaxTilesFromMaxUpdateBucket);
+
+	Newline(Context);
+	Print(Context, TEXT("Out "));
+
+	Newline(Context);
+	Print(Context, TEXT(" Pages "));
+	Print(Context, CardPageIndexAllocator[0]);
+
+	Newline(Context);
+	Print(Context, TEXT(" Tiles "));
+	Print(Context, CardPageTileAllocator[CARD_PAGE_TILE_ALLOCATOR_STRIDE * CardUpdateContext + 0]);
+}
+
+/** 
+ * Print out various stats for debugging surface cache updates
+ */
+[numthreads(1, 1, 1)]
+void LumenSceneLightingStatsCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	if (LightingStatMode == 1)
+	{
+		LumenSceneLightingStats(CARD_UPDATE_CONTEXT_DIRECT_LIGHTING, DirectLightingCardPageIndexAllocator);
+	}
+	else
+	{
+		LumenSceneLightingStats(CARD_UPDATE_CONTEXT_INDIRECT_LIGHTING, IndirectLightingCardPageIndexAllocator);
+	}
+}
+#endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_DEBUG
+uint NumLights;
+uint NumViews;
+uint NumBatchedLights;
+uint NumStandaloneLights;
+uint bHasRectLights;
+uint bHasLightFunctionLights;
+uint bHasIESLights;
+uint bStochastic;
+uint bHWRT;
+uint bValidDebugData;
+
+int2 AtlasResolution;
+int2 UpdateAtlasSize;
+uint MaxUpdateTiles;
+uint UpdateFactor;
+
+StructuredBuffer<uint> CompactedTraceAllocator;
+
+StructuredBuffer<uint> CardPageIndexAllocator;
+StructuredBuffer<uint> CardPageIndexData;
+
+StructuredBuffer<uint> CardTileAllocator;
+StructuredBuffer<uint> CardTiles;
+
+StructuredBuffer<uint> DebugDataBuffer;
+
+void DrawTile(inout FShaderPrintContext Ctx, uint InCardIndex, float2 UVMin, float2 UVMax, float4 Color)
+{
+	const float Depth = 0.f;
+	const FLumenCardData Card = GetLumenCardData(InCardIndex);
+	const float3 P0 = GetCardWorldPosition(Card, float2(UVMin.x, UVMin.y), Depth);
+	const float3 P1 = GetCardWorldPosition(Card, float2(UVMax.x, UVMin.y), Depth);
+	const float3 P2 = GetCardWorldPosition(Card, float2(UVMax.x, UVMax.y), Depth);
+	const float3 P3 = GetCardWorldPosition(Card, float2(UVMin.x, UVMax.y), Depth);
+
+	AddQuadWS(Ctx, P0, P1, P2, P3, Color);
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void LumenSceneDirectLightingStatsCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (all(DispatchThreadId == 0))
+	{
+		FShaderPrintContext Ctx = InitShaderPrintContext(true, uint2(50, 50));
+
+		Print(Ctx, TEXT("Lumen Scene Direct Lighting"), FontEmerald); Newline(Ctx);
+		Print(Ctx, TEXT("#Views       : "), FontWhite); Print(Ctx, NumViews, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("#Lights      : "), FontWhite); Print(Ctx, NumLights, FontYellow); Newline(Ctx);
+		Newline(Ctx);
+
+		Print(Ctx, TEXT("Lights"), FontEmerald); Newline(Ctx);
+		Print(Ctx, TEXT("Batched Lights   : "), FontWhite); Print(Ctx, NumBatchedLights, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("Standalone Lights: "), FontWhite); Print(Ctx, NumStandaloneLights, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("Rect lights      : "), FontWhite); PrintBool(Ctx, bHasRectLights > 0); Newline(Ctx);
+		Print(Ctx, TEXT("Light functions  : "), FontWhite); PrintBool(Ctx, bHasLightFunctionLights > 0); Newline(Ctx);
+		Print(Ctx, TEXT("IES lights       : "), FontWhite); PrintBool(Ctx, bHasIESLights > 0); Newline(Ctx);
+		Newline(Ctx);
+
+		Print(Ctx, TEXT("Atlas"), FontEmerald); Newline(Ctx);
+		Print(Ctx, TEXT("AtlasResolution: "), FontWhite); Print(Ctx, AtlasResolution, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("UpdateAtlasSize: "), FontWhite); Print(Ctx, UpdateAtlasSize, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("MaxUpdateTiles : "), FontWhite); Print(Ctx, MaxUpdateTiles, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("UpdateFactor   : "), FontWhite); Print(Ctx, UpdateFactor, FontYellow); Newline(Ctx);
+		Newline(Ctx);
+
+		// For non-stochastic path CompactedTraceAllocator is an overestimate of the number of trace.
+		const uint TraceCount = CompactedTraceAllocator[0];
+
+		Print(Ctx, TEXT("Trace"), FontEmerald); Newline(Ctx);
+		Print(Ctx, TEXT("Method     : "), FontWhite); if (bHWRT) { Print(Ctx, TEXT("Hardware"), FontYellow); } else { Print(Ctx, TEXT("Software"), FontYellow); } Newline(Ctx);
+		Print(Ctx, TEXT("RT Traces  : "), FontWhite); Print(Ctx, TraceCount, FontYellow); Newline(Ctx);
+		Newline(Ctx);
+
+		// TODO: dispatch one per lane instead of a LOOP		
+		const uint AllocatedCard = CardPageIndexAllocator[0];
+		const uint AllocatedCardTile = CardTileAllocator[0];
+		Print(Ctx, TEXT("Card"), FontEmerald); Newline(Ctx);		
+		Print(Ctx, TEXT("Updating Card  : "), FontWhite); Print(Ctx, AllocatedCard, FontYellow); Newline(Ctx);
+		Print(Ctx, TEXT("Updating Tiles : "), FontWhite); Print(Ctx, AllocatedCardTile, FontYellow); Newline(Ctx);
+		const bool bViewCards = AddCheckbox(Ctx, TEXT("View Cards"), false, FontWhite); Newline(Ctx);
+		const bool bViewCardTiles = AddCheckbox(Ctx, TEXT("View Tiles"), false, FontWhite); Newline(Ctx);
+
+		FLumenSceneDebugData DebugData = InitLumenSceneDebugData();
+		if (bValidDebugData > 0)
+		{
+			DebugData = ReadDebugData(DebugDataBuffer);
+		}
+
+		// Tiles OBBs
+		uint SelectedCardIndex = LUMEN_INVALID_CARD_INDEX;
+		float2 SelectedUVMin = 0;
+		float2 SelectedUVMax = 0;
+		if (bViewCardTiles || DebugData.bValid)
+		{
+			for (uint CardTileIt=0; CardTileIt < AllocatedCardTile; ++CardTileIt)
+			{
+				const FCardTileData CardTile = UnpackCardTileData(CardTiles[CardTileIt]);
+				const FLumenCardPageData CardPage = GetLumenCardPageData(CardTile.CardPageIndex);
+				if (CardPage.CardIndex >= 0)
+				{
+					const uint2 SizeInTiles = CardPage.SizeInTexels / CARD_TILE_SIZE;
+					const float2 UVMin = float2(CardTile.TileCoord) / SizeInTiles;
+					const float2 UVMax = float2(CardTile.TileCoord + 1) / SizeInTiles;
+					
+					bool bSelected = false;
+					if (CardTile.CardPageIndex == DebugData.CardPageIndex)
+					//if (CardPage.CardIndex == DebugData.CardIndex)
+					{
+						if (all(DebugData.PhysicalAtlasUV >= CardPage.PhysicalAtlasUVRect.xy) &&
+							all(DebugData.PhysicalAtlasUV <= CardPage.PhysicalAtlasUVRect.zw))
+						{
+							const float2 CardUV = (DebugData.PhysicalAtlasUV - CardPage.PhysicalAtlasUVRect.xy) / (CardPage.PhysicalAtlasUVRect.zw - CardPage.PhysicalAtlasUVRect.xy);
+							if (all(CardUV >= UVMin) && all(CardUV < UVMax))
+							{
+								SelectedCardIndex = CardPage.CardIndex;
+								SelectedUVMin = UVMin;
+								SelectedUVMax = UVMax;
+							}
+						}
+					}
+
+					if (bViewCardTiles)
+					{
+						DrawTile(Ctx, CardPage.CardIndex, UVMin, UVMax, ColorYellow);
+					}
+				}
+			}
+		}
+
+		// Cards OBBs
+		if (bViewCards)
+		{
+			// Card data
+			for (uint CardIt=0; CardIt < AllocatedCard; ++CardIt)
+			{
+				const FLumenCardPageData CardPage = GetLumenCardPageData(CardPageIndexData[CardIt]);
+				if (CardPage.CardIndex >= 0)
+				{
+					const bool bSelected = CardPage.CardIndex == DebugData.CardIndex;
+					DrawTile(Ctx, CardPage.CardIndex, float2(0,0), float2(1,1), bSelected ? ColorRed : ColorGreen);
+				}
+			}
+		}
+
+		// Selected Tile
+		// Drawn last for better visibility with lines overlapping
+		if (SelectedCardIndex != LUMEN_INVALID_CARD_INDEX)
+		{
+			DrawTile(Ctx, SelectedCardIndex, SelectedUVMin, SelectedUVMax, ColorPurple);
+		}
+	}
+}
+#endif

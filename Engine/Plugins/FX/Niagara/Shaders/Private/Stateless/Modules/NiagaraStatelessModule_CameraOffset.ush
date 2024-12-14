@@ -1,0 +1,16 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../NiagaraStatelessCommon.ush"
+
+FNiagaraStatelessBuiltDistributionType CameraOffset_Distribution;
+
+void CameraOffset_Simulate(inout FStatelessParticle Particle)
+{
+	FStatelessDistributionSamplerFloat OffsetSampler;
+	OffsetSampler.Init(0, CameraOffset_Distribution);
+	if (OffsetSampler.IsValid())
+	{
+		Particle.CameraOffset			= OffsetSampler.GetValue(Particle.NormalizedAge);
+		Particle.PreviousCameraOffset	= OffsetSampler.GetValue(Particle.PreviousNormalizedAge);
+	}
+}

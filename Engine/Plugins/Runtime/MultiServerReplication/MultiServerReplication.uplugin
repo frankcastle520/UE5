@@ -1,0 +1,32 @@
+{
+	"FileVersion": 3,
+	"FriendlyName": "MultiServerReplication Plugin",
+	"Version": 1,
+	"VersionName": "1.0",
+	"Description": "",
+	"Category": "Epic Internal",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "http://epicgames.com",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsExperimentalVersion":  true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "MultiServerReplication",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MultiServerConfiguration",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "OnlineSubsystemUtils",
+			"Enabled": true
+		}
+	]
+}

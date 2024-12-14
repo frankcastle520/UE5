@@ -1,0 +1,72 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Include required for platform TANGENT_RWBUFFER_FORMAT.
+#include "/Engine/Private/GpuSkinCommon.ush"
+
+uint {DataInterfaceName}_NumVertices;
+uint {DataInterfaceName}_InputStreamStart;
+
+RWBuffer<float> {DataInterfaceName}_PositionBufferUAV;
+RWBuffer<TANGENT_RWBUFFER_FORMAT> {DataInterfaceName}_TangentBufferUAV;
+RWBuffer<UNORM float4> {DataInterfaceName}_ColorBufferUAV;
+
+Buffer<float> {DataInterfaceName}_PositionStaticBuffer;
+Buffer<TANGENT_RWBUFFER_FORMAT> {DataInterfaceName}_TangentStaticBuffer;
+Buffer<UNORM float4> {DataInterfaceName}_ColorStaticBuffer;
+uint {DataInterfaceName}_ColorIndexMask;
+
+uint ReadNumVertices_{DataInterfaceName}()
+{
+	return {DataInterfaceName}_NumVertices;
+}
+
+float3 ReadPosition_{DataInterfaceName}(uint VertexIndex)
+{
+	uint BufferIndex = ({DataInterfaceName}_InputStreamStart + VertexIndex) * 3;
+
+#if READABLE_OUTPUT_BUFFERS & OPTIMUS_SKINNED_MESH_READ_POSITION
+	return float3(
+		{DataInterfaceName}_PositionBufferUAV[BufferIndex + 0], 
+		{DataInterfaceName}_PositionBufferUAV[BufferIndex + 1],
+		{DataInterfaceName}_PositionBufferUAV[BufferIndex + 2]);
+#else
+	return float3(
+		{DataInterfaceName}_PositionStaticBuffer[BufferIndex + 0], 
+		{DataInterfaceName}_PositionStaticBuffer[BufferIndex + 1],
+		{DataInterfaceName}_PositionStaticBuffer[BufferIndex + 2]);
+#endif 
+}
+
+float4 ReadTangentX_{DataInterfaceName}(uint VertexIndex)
+{
+	uint BufferIndex = ({DataInterfaceName}_InputStreamStart + VertexIndex) * 2;
+	
+#if READABLE_OUTPUT_BUFFERS & OPTIMUS_SKINNED_MESH_READ_TANGENTS
+	return TangentBias_SkinCache({DataInterfaceName}_TangentBufferUAV[BufferIndex]) ;
+#else	
+	return TangentBias_SkinCache({DataInterfaceName}_TangentStaticBuffer[BufferIndex]) ;
+#endif
+}
+
+float4 ReadTangentZ_{DataInterfaceName}(uint VertexIndex)
+{
+	uint BufferIndex = ({DataInterfaceName}_InputStreamStart + VertexIndex) * 2;
+#if READABLE_OUTPUT_BUFFERS & OPTIMUS_SKINNED_MESH_READ_TANGENTS
+	return TangentBias_SkinCache({DataInterfaceName}_TangentBufferUAV[BufferIndex + 1]) ;
+#else	
+	return TangentBias_SkinCache({DataInterfaceName}_TangentStaticBuffer[BufferIndex + 1]) ;
+#endif
+}
+
+float4 ReadColor_{DataInterfaceName}(uint VertexIndex)
+{
+	// Index Mask is used here in case ColorStaticBuffer is bound to the GWhiteVertexBufferWithSRV that is only a few bytes
+	uint BufferIndex = ({DataInterfaceName}_InputStreamStart + VertexIndex) & ({DataInterfaceName}_ColorIndexMask);
+#if READABLE_OUTPUT_BUFFERS & OPTIMUS_SKINNED_MESH_READ_COLOR
+	return {DataInterfaceName}_ColorBufferUAV[BufferIndex] FMANUALFETCH_COLOR_COMPONENT_SWIZZLE;
+#else	
+	return {DataInterfaceName}_ColorStaticBuffer[BufferIndex] FMANUALFETCH_COLOR_COMPONENT_SWIZZLE;
+#endif	
+}
+
+

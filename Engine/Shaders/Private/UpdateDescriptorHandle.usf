@@ -1,0 +1,39 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	UpdateDescriptorHandle.usf
+=============================================================================*/
+
+#include "Common.ush"
+
+#if COMPILER_METAL_SHADER_CONVERTER
+struct MetalDescriptor
+{
+    uint64_t gpuVA;
+    uint64_t textureViewID;
+    uint64_t metadata;
+};
+typedef MetalDescriptor Descriptor;
+#else
+struct DefaultDescriptor
+{
+    uint64_t gpuIndex;
+};
+typedef DefaultDescriptor Descriptor;
+#endif
+
+uint NumUpdates;
+
+StructuredBuffer<uint> DescriptorIndices;
+StructuredBuffer<Descriptor> DescriptorEntries;
+RWStructuredBuffer<Descriptor> OutputData;
+
+[numthreads(1, 1, 1)]
+void MainCS(uint DispatchThreadId : SV_DispatchThreadID)
+{
+	if(DispatchThreadId < NumUpdates)
+	{
+        uint DestEntryIdx = DescriptorIndices[DispatchThreadId];
+        OutputData[DestEntryIdx] = DescriptorEntries[DispatchThreadId];
+	}
+}

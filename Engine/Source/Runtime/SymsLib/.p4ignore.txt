@@ -1,0 +1,4 @@
+.vs/
+*.vxproj.user
+*.vcxproj.user
+obj/

@@ -1,0 +1,106 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "NaniteDataDecode.ush"
+#include "NaniteStreaming.ush"
+#include "../ComputeShaderUtils.ush"
+
+RWStructuredBuffer<FStreamingRequest>	OutStreamingRequests;
+
+[numthreads(1, 1, 1)]
+void ClearStreamingRequestCount()
+{
+	OutStreamingRequests[0].RuntimeResourceID_Magic = 0;	// First entry holds count
+}
+
+uint NumClusterUpdates;
+StructuredBuffer<uint>	PackedClusterUpdates;
+RWByteAddressBuffer		ClusterPageBuffer;
+
+[numthreads(64, 1, 1)]
+void UpdateClusterLeafFlags(uint DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId >= NumClusterUpdates)
+	{
+		return;
+	}
+
+	const uint PackedUpdate	= PackedClusterUpdates[DispatchThreadId];
+	const uint Offset		= PackedUpdate & 0xFFFFFFFCu;
+	const bool bLeaf		= (PackedUpdate & 1u) != 0;
+	const bool bReset		= (PackedUpdate & 2u) != 0;
+
+	if (bReset)
+	{
+		uint Flags = ClusterPageBuffer.Load(Offset);
+
+		bool bRootLeaf = (Flags & NANITE_CLUSTER_FLAG_ROOT_LEAF);
+		Flags &= ~NANITE_CLUSTER_FLAG_STREAMING_LEAF;
+		Flags |= (bRootLeaf ? NANITE_CLUSTER_FLAG_STREAMING_LEAF : 0u);
+		ClusterPageBuffer.Store(Offset, Flags);
+	}
+	else
+	{
+		if (bLeaf)
+		{
+			ClusterPageBuffer.InterlockedOr(Offset, NANITE_CLUSTER_FLAG_STREAMING_LEAF);
+		}
+		else
+		{
+			ClusterPageBuffer.InterlockedAnd(Offset, ~NANITE_CLUSTER_FLAG_STREAMING_LEAF);
+		}
+	}
+	
+}
+
+uint SrcOffset;
+uint DstOffset;
+uint NumThreads;
+
+[numthreads(64, 1, 1)]
+void Memcpy(uint3 GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint DispatchThreadId = GetUnWrappedDispatchThreadId(GroupID, GroupIndex, 64);
+	if (DispatchThreadId >= NumThreads)
+		return;
+	
+	const uint4 Data = ClusterPageBuffer.Load4(SrcOffset + (DispatchThreadId << 4));	//TODO: Optimize with multiple loads?
+	ClusterPageBuffer.Store4(DstOffset + (DispatchThreadId << 4), Data);
+}
+
+uint OldRootPageStart;
+uint NewRootPageStart;
+
+RWByteAddressBuffer		HierarchyBufferUAV;
+
+[numthreads(64, 1, 1)]
+void RelocateHierarchy(uint3 GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint DispatchThreadId = GetUnWrappedDispatchThreadId(GroupID, GroupIndex, 64);
+
+	if (DispatchThreadId >= NumThreads)
+		return;
+
+	const uint NodeIndex	= DispatchThreadId >> NANITE_MAX_BVH_NODE_FANOUT_BITS;
+	const uint ChildIndex	= DispatchThreadId & NANITE_MAX_BVH_NODE_FANOUT_MASK;
+
+	FHierarchyNodeSlice Node = GetHierarchyNodeSlice(HierarchyBufferUAV, NodeIndex, ChildIndex);
+	
+	if (Node.bEnabled && Node.bLeaf)	// Cluster group
+	{
+		uint ChildStartReference = Node.ChildStartReference;
+		
+		if (Node.NumPages == 0)
+		{
+			// Only root dependencies: Relocate
+			ChildStartReference += (NewRootPageStart - OldRootPageStart) << NANITE_MAX_CLUSTERS_PER_PAGE_BITS;
+		}
+		else
+		{
+			// Streaming dependencies: Detach
+			ChildStartReference = 0xFFFFFFFFu;
+		}
+			
+		StoreHierarchyNodeChildStartReference(HierarchyBufferUAV, NodeIndex, ChildIndex, ChildStartReference);
+	}		
+}

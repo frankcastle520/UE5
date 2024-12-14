@@ -1,0 +1,29 @@
+{
+	"FileVersion" : 3,
+	"Version" : 2,
+	"VersionName" : "2.0",
+	"FriendlyName" : "Stylus & Tablet Plugin",
+	"Description" : "Support for advanced stylus and tablet inputs such as pressure, stylus and tablet buttons, and pen angles.",
+	"Category" : "Input Devices",
+	"CreatedBy" : "Epic Games, Inc.",
+	"CreatedByURL" : "https://epicgames.com",
+	"DocsURL" : "",
+	"MarketplaceURL" : "",
+	"SupportURL" : "",
+	"EnabledByDefault" : false,
+	"CanContainContent" : false,
+	"IsBetaVersion" : true,
+	"Installed" : false,
+	"Modules" :
+	[
+		{
+			"Name" : "StylusInput",
+			"Type" : "Editor",
+			"LoadingPhase" : "Default"
+		},
+		{
+			"Name": "StylusInputDebugWidget",
+			"Type": "Editor"
+		}
+	]
+}

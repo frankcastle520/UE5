@@ -1,0 +1,131 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+/*=============================================================================
+	SubstratePublic.ush: Public facing API for external users of Substrate.
+=============================================================================*/
+
+#include "/Engine/Private/Substrate/Substrate.ush"
+
+#if SUBSTRATE_ENABLED 
+
+#define SUBSTRATE_ALLOWS_GBUFFER_SAMPLING  ((NEEDS_SCENE_TEXTURES && !SCENE_TEXTURES_DISABLED) && SUBSTRATE_MATERIALCONTAINER_IS_VIEWRESOURCE)
+
+/** Public facing functions allowing external users access to some Substrate data. */
+
+#ifndef SubstratePublicStruct
+#error One must specify the SubstratePublicStruct uniform buffer to fetch data from when using SubstratePuclic.ush
+#endif
+
+struct FSubstrateGBuffer
+{
+	bool bIsValid;
+
+	float3 DiffuseColor;
+	float3 SpecularColor;
+	float3 SubsurfaceColor;
+	float3 BaseColor;
+	float  Specular;
+	float  Metallic;
+	float3 WorldNormal;
+	float  Opacity;
+	float  Roughness;
+	float  MaterialAO;
+	float3 ShadingModelColor;
+	float  ShadingModelID;
+	float3 StoredBaseColor;
+	float3 StoredSpecular;
+	float3 WorldTangent;
+	float  Anisotropy;
+};
+
+FSubstrateGBuffer SubstratePublic_GetSubstrateGBufferFromFirstBSDF(uint2 PixelCoord)
+{
+	FSubstrateGBuffer SGBuffer = (FSubstrateGBuffer)0; 
+	SGBuffer.bIsValid = false;
+	SGBuffer.WorldNormal = float3(0.0, 0.0, 1.0);
+
+#if SUBSTRATE_ALLOWS_GBUFFER_SAMPLING
+	FSubstrateAddressing SubstrateAddressing   = GetSubstratePixelDataByteOffset(PixelCoord, uint2(View.BufferSizeAndInvSize.xy), SubstratePublicStruct.MaxBytesPerPixel);
+	FSubstratePixelHeader SubstratePixelHeader = UnpackSubstrateHeaderIn(SubstratePublicStruct.MaterialTextureArray, SubstrateAddressing, SubstratePublicStruct.TopLayerTexture);
+	
+	BRANCH
+	if (SubstratePixelHeader.ClosureCount > 0)
+	{
+		const FSubstrateSubsurfaceHeader SSSHeader = SubstrateLoadSubsurfaceHeader(SubstratePublicStruct.MaterialTextureArray, SubstratePublicStruct.FirstSliceStoringSubstrateSSSData, SubstrateAddressing.PixelCoords);
+
+		const bool bSkipSSSMaterialOverride = true; // We do not want the material data to be affected by any override.
+		FSubstrateBSDF BSDF = UnpackSubstrateBSDFIn(SubstratePublicStruct.MaterialTextureArray, SubstrateAddressing, SubstratePixelHeader, bSkipSSSMaterialOverride);
+	
+		SGBuffer.bIsValid			= true;
+		SGBuffer.DiffuseColor		= SubstrateGetBSDFDiffuseColor(BSDF);
+		SGBuffer.SpecularColor		= SubstrateGetBSDFSpecularColor(BSDF);
+		SGBuffer.SubsurfaceColor	= SubstrateGetBSDFSubSurfaceColor(BSDF);
+		SGBuffer.BaseColor			= SubstrateGetBSDFBaseColor(BSDF);
+		SGBuffer.Specular			= SubstrateGetBSDFSpecular(BSDF);
+		SGBuffer.Metallic			= SubstrateGetBSDFMetallic(BSDF);
+		SGBuffer.WorldNormal		= SubstrateGetWorldNormal(SubstratePixelHeader, BSDF, SubstrateAddressing);
+		SGBuffer.Roughness			= SubstrateGetBSDFRoughness(BSDF);
+		SGBuffer.MaterialAO			= SubstrateGetAO(SubstratePixelHeader);
+		SGBuffer.ShadingModelColor	= GetShadingModelColor(SubstrateGetLegacyShadingModels(BSDF));
+		SGBuffer.ShadingModelID		= SubstrateGetLegacyShadingModels(BSDF);
+		SGBuffer.StoredBaseColor	= SubstrateGetBSDFBaseColor(BSDF);
+		SGBuffer.StoredSpecular		= SubstrateGetBSDFSpecular(BSDF).rrr;
+		SGBuffer.WorldTangent		= SubstrateGetWorldTangent(SubstratePixelHeader, BSDF, SubstrateAddressing);
+		SGBuffer.Anisotropy			= SubstrateGetBSDFAnisotropy(BSDF);
+
+		SGBuffer.Opacity			= 0.0f;
+		if (SubstrateSubSurfaceHeaderGetSSSType(SSSHeader) != SSS_TYPE_INVALID)
+		{
+			SGBuffer.Opacity = SubstrateSubSurfaceHeaderGetOpacity(SSSHeader);
+		}
+		else if (BSDF_GETTYPE(BSDF) == SUBSTRATE_BSDF_TYPE_SLAB)
+		{
+			if (BSDF_GETHASFUZZ(BSDF))
+			{
+				SGBuffer.Opacity = SLAB_FUZZ_AMOUNT(BSDF);	// Cloth
+			}
+			else if (BSDF_GETHASHAZINESS(BSDF))
+			{
+				const FHaziness Haziness = UnpackHaziness(SLAB_HAZINESS(BSDF));
+				const bool bHazeAsSimpleClearCoat = Haziness.bSimpleClearCoat;
+				if (bHazeAsSimpleClearCoat)
+				{
+					SGBuffer.Opacity = Haziness.Weight;		// ClearCoat
+				}
+			}
+		}
+		else if (BSDF_GETTYPE(BSDF) == SUBSTRATE_BSDF_TYPE_EYE)
+		{
+			SGBuffer.Opacity = 1 - EYE_IRISMASK(BSDF);		// IrisMask
+		}
+		else if (BSDF_GETTYPE(BSDF) == SUBSTRATE_BSDF_TYPE_HAIR)
+		{
+			SGBuffer.Opacity = HAIR_BACKLIT(BSDF);			// BackLit
+		}
+	}
+#endif
+
+	return SGBuffer;
+}
+
+// Optimised data fetch from the TopLayer texture
+float3 SubstratePublic_GetWorldNormal(uint2 PixelCoord)
+{
+#if SUBSTRATE_ALLOWS_GBUFFER_SAMPLING
+  return SubstrateUnpackTopLayerData(SubstratePublicStruct.TopLayerTexture.Load(uint3(PixelCoord, 0))).WorldNormal;
+#else
+	return float3(0, 0, 1);
+#endif
+}
+float SubstratePublic_GetRoughness(uint2 PixelCoord)
+{
+#if SUBSTRATE_ALLOWS_GBUFFER_SAMPLING
+  return SubstrateUnpackTopLayerData(SubstratePublicStruct.TopLayerTexture.Load(uint3(PixelCoord, 0))).Roughness;
+#else
+	return 0.0;
+#endif
+}
+
+#endif

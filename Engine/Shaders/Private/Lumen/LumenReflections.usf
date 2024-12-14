@@ -1,0 +1,396 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "LumenMaterial.ush"
+
+#include "../SceneTextureParameters.ush"
+#include "../BRDF.ush"
+#include "../Random.ush"
+#include "LumenReflectionCommon.ush"
+#include "../ClearCoatCommon.ush"
+#include "../FastMath.ush"
+#include "LumenRadianceCacheCommon.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 1
+#endif
+
+#ifndef FRONT_LAYER_TRANSLUCENCY
+#define FRONT_LAYER_TRANSLUCENCY 0
+#endif
+
+RWBuffer<uint> RWReflectionClearTileIndirectArgs;
+RWBuffer<uint> RWReflectionResolveTileIndirectArgs;
+RWBuffer<uint> RWReflectionTracingTileIndirectArgs;
+RWTexture2DArray<float> RWDownsampledDepth;
+
+groupshared uint SharedTileNeedsResolve[4][4];
+groupshared uint SharedTileNeedsTracing;
+
+// Must match cpp GReflectionResolveTileSize
+#define RESOLVE_TILE_SIZE 8
+
+#ifndef PERMUTATION_OVERFLOW_TILE
+#define PERMUTATION_OVERFLOW_TILE 0
+#endif
+
+RWTexture2DArray<uint> RWResolveTileUsed;
+
+groupshared uint SharedTileClassification;
+
+[numthreads(RESOLVE_TILE_SIZE, RESOLVE_TILE_SIZE, 1)] 
+void ReflectionTileClassificationMarkCS(
+	uint2 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	if (DispatchThreadId.x < 3 && DispatchThreadId.y == 0 && DispatchThreadId.z == 0 && PERMUTATION_OVERFLOW_TILE == 0)
+	{
+		// Clear indirect args for future pass
+		RWReflectionClearTileIndirectArgs[DispatchThreadId.x] = (DispatchThreadId.x == 0) ? 0 : 1;
+		RWReflectionResolveTileIndirectArgs[DispatchThreadId.x] = (DispatchThreadId.x == 0) ? 0 : 1;
+		RWReflectionTracingTileIndirectArgs[DispatchThreadId.x] = (DispatchThreadId.x == 0) ? 0 : 1;
+	}
+
+	if (all(GroupThreadId == 0))
+	{
+		SharedTileClassification = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	bool bIsValid = all(DispatchThreadId.xy < View.ViewRectMinAndSize.zw);
+	bool bIsAnyValid = bIsValid;
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoord(DispatchThreadId.xy + View.ViewRectMinAndSize.xy, SUBSTRATE_ENABLED ? DispatchThreadId.z : 0);
+	const uint3 FlattenTileCoord = uint3(GroupId, Coord.ClosureIndex);
+
+	const uint2 DownSampleDepthCoord = DispatchThreadId.xy / ReflectionDownsampleFactor;
+	const bool bIsDownSampleDepthCoordValid = all(DownSampleDepthCoord < ReflectionTracingViewSize);
+
+#if SUBSTRATE_ENABLED
+	if (bIsValid && Coord.ClosureIndex > 0)
+	{
+		FSubstrateAddressing SubstrateAddressing = GetSubstratePixelDataByteOffset(Coord.SvPosition, uint2(View.BufferSizeAndInvSize.xy), Substrate.MaxBytesPerPixel);
+		FSubstratePixelHeader SubstratePixelHeader= UnpackSubstrateHeaderIn(Substrate.MaterialTextureArray, SubstrateAddressing, Substrate.TopLayerTexture);
+		bIsValid = Coord.ClosureIndex < SubstratePixelHeader.ClosureCount;
+	}
+#endif
+
+	if (bIsValid)
+	{
+		const FLumenMaterialData Material = ApplySmoothBias(ReadMaterialData(Coord, MaxRoughnessToTrace), false /*bTopLayerRoughness*/);
+		if (NeedRayTracedReflections(Material.Roughness, Material))
+		{
+			// Metal compiler issue: it requires `+=` instead of `=` to record the tile as of UE 5.0
+			SharedTileClassification += 1;
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (all(GroupThreadId == 0) && bIsAnyValid)
+	{
+		RWResolveTileUsed[FlattenTileCoord] = SharedTileClassification > 0 ? 1u : 0;
+	}
+
+	// Clear tiles that the generate shader won't run on
+	if (SharedTileClassification == 0 && bIsDownSampleDepthCoordValid)
+	{
+		RWDownsampledDepth[uint3(DownSampleDepthCoord, Coord.ClosureIndex)] = -1.0f;
+	}
+}
+
+RWBuffer<uint> RWReflectionClearTileData;
+RWBuffer<uint> RWReflectionTileIndirectArgs;
+RWBuffer<uint> RWReflectionTileData;
+Texture2DArray<uint> ResolveTileUsed;
+
+uint2 TileViewportDimensions;
+uint2 ResolveTileViewportDimensions;
+
+groupshared uint SharedNumTiles;
+groupshared uint SharedNumClearTiles;
+groupshared uint SharedTileData[THREADGROUP_SIZE * THREADGROUP_SIZE];
+groupshared uint SharedTileUsed[THREADGROUP_SIZE * THREADGROUP_SIZE];
+groupshared uint SharedGlobalTileOffset;
+groupshared uint SharedGlobalClearTileOffset;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)] 
+void ReflectionTileClassificationBuildListsCS(
+	uint3 GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	const uint ThreadIndex = GroupThreadId.y * THREADGROUP_SIZE + GroupThreadId.x;
+
+	// When generating downsampled trace tiles we need to downsample ResolveTileUsed to shared memory first
+#if SUPPORT_DOWNSAMPLE_FACTOR
+	SharedTileUsed[ThreadIndex] = 0;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint  TileUsed = 0;
+	uint2 TileCoordinate = GroupId.xy * THREADGROUP_SIZE + GroupThreadId;
+	uint  ClosureIndex = SUBSTRATE_ENABLED ? GroupId.z : 0;
+
+	// Gather whether any of the resolve tiles corresponding to this tracing tile were used
+	for (uint Y = 0; Y < ReflectionDownsampleFactor; Y++)
+	{
+		for (uint X = 0; X < ReflectionDownsampleFactor; X++)
+		{
+			uint2 ResolveTileCoordinate = TileCoordinate * ReflectionDownsampleFactor + uint2(X, Y);
+
+			if (all(ResolveTileCoordinate < ResolveTileViewportDimensions))
+			{
+				TileUsed = TileUsed || ResolveTileUsed[uint3(ResolveTileCoordinate, ClosureIndex)];
+			}
+		}
+	}
+
+	SharedTileUsed[ThreadIndex] = TileUsed;
+
+	GroupMemoryBarrierWithGroupSync();
+#endif
+
+	//@todo - parallel version
+	if (ThreadIndex == 0)
+	{
+		SharedNumTiles = 0;
+		SharedNumClearTiles = 0;
+
+		for (uint x = 0; x < THREADGROUP_SIZE * THREADGROUP_SIZE; x++)
+		{
+			const uint2 ThreadOffset = ZOrder2D(x, log2(THREADGROUP_SIZE));
+
+			#if PERMUTATION_OVERFLOW_TILE && SUBSTRATE_ENABLED
+			const uint LinearIndex = GroupId.x * THREADGROUP_SIZE * THREADGROUP_SIZE + x;
+			const bool bIsTileValid = LinearIndex < Substrate.ClosureTileCountBuffer[0];
+			FReflectionTileData TileData = (FReflectionTileData)0;
+			if (bIsTileValid)
+			{
+				const FSubstrateClosureTile Tile = UnpackClosureTile(Substrate.ClosureTileBuffer[LinearIndex]);
+				TileData.Coord = Tile.TileCoord;
+				TileData.ClosureIndex = Tile.ClosureIndex;
+			}
+			const bool bIsValid = bIsTileValid && all(TileData.Coord < TileViewportDimensions);
+			#else
+			// ZOrder tiles to maximize screen locality after converting to 1d for compaction
+			// The tile locality ultimately affects trace coherency, since trace compaction pulls from neighboring tiles
+			FReflectionTileData TileData;
+			TileData.Coord        = GroupId.xy * THREADGROUP_SIZE + ThreadOffset;
+			TileData.ClosureIndex = SUBSTRATE_ENABLED ? GroupId.z : 0;
+			const bool bIsValid   = all(TileData.Coord < TileViewportDimensions);
+			#endif
+
+			if (bIsValid)
+			{
+				bool bTileUsed;
+
+				#if SUPPORT_DOWNSAMPLE_FACTOR
+					bTileUsed = SharedTileUsed[ThreadOffset.y * THREADGROUP_SIZE + ThreadOffset.x];
+				#else
+					const uint3 TileCoordFlatten = uint3(TileData.Coord, TileData.ClosureIndex);
+					bTileUsed = ResolveTileUsed[TileCoordFlatten];
+				#endif
+
+				if (bTileUsed)
+				{
+					uint TileOffset = SharedNumTiles;
+					// Note: Must match encoding in WaterTileCatergorisationBuildListsCS
+					SharedTileData[TileOffset] = PackTileData(TileData);
+					SharedNumTiles = TileOffset + 1;
+				}
+				else
+				{
+					#if !SUPPORT_DOWNSAMPLE_FACTOR
+					{
+						// Pack clear tiles from the other end
+						uint TileOffset = SharedNumClearTiles;
+						SharedTileData[THREADGROUP_SIZE * THREADGROUP_SIZE - 1 - TileOffset] = PackTileData(TileData);
+						SharedNumClearTiles = TileOffset + 1;
+					}
+					#endif
+				}
+			}
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (ThreadIndex == 0 && SharedNumTiles > 0)
+	{
+		InterlockedAdd(RWReflectionTileIndirectArgs[0], SharedNumTiles, SharedGlobalTileOffset);
+	}
+
+	#if !SUPPORT_DOWNSAMPLE_FACTOR
+	{
+		if (ThreadIndex == 0 && SharedNumClearTiles > 0)
+		{
+			InterlockedAdd(RWReflectionClearTileIndirectArgs[0], SharedNumClearTiles, SharedGlobalClearTileOffset);
+		}
+	}
+	#endif
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (ThreadIndex < SharedNumTiles)
+	{
+		RWReflectionTileData[SharedGlobalTileOffset + ThreadIndex] = SharedTileData[ThreadIndex];
+	}
+	else
+	{
+		#if !SUPPORT_DOWNSAMPLE_FACTOR
+		uint LocalThreadIndex = ThreadIndex - SharedNumTiles;
+		if (LocalThreadIndex < SharedNumClearTiles)
+		{
+			RWReflectionClearTileData[SharedGlobalClearTileOffset + LocalThreadIndex] = SharedTileData[THREADGROUP_SIZE * THREADGROUP_SIZE - 1 - LocalThreadIndex];
+		}
+		#endif
+	}
+}
+
+float GGXSamplingBias;
+float MaxTraceDistance;
+float RadianceCacheAngleThresholdScale;
+
+RWTexture2DArray<uint> RWRayTraceDistance;
+RWTexture2DArray<float4> RWRayBuffer;
+
+float2 GenerateRandom(uint2 InReflectionTracingCoord)
+{
+#define BLUE_NOISE_LUT 1
+#if BLUE_NOISE_LUT
+	float2 E = BlueNoiseVec2(InReflectionTracingCoord, ReflectionsRayDirectionFrameIndex);
+#else
+	uint2 RandomSeed = Rand3DPCG16(int3(InReflectionTracingCoord, ReflectionsStateFrameIndexMod8)).xy;
+	float2 E = Hammersley16(0, 1, RandomSeed);
+#endif
+	E.y *= 1 - GGXSamplingBias;
+	return E;
+}
+
+[numthreads(REFLECTION_THREADGROUP_SIZE_1D, 1, 1)]
+void ReflectionGenerateRaysCS(
+	uint GroupId : SV_GroupID,
+	uint GroupThreadId : SV_GroupThreadID)
+{
+	FReflectionTileData TileData;
+	uint3 ReflectionTracingCoord = GetReflectionTracingScreenCoord(GroupId, GroupThreadId, TileData);
+	bool bIsValid = all(ReflectionTracingCoord.xy < ReflectionTracingViewSize);
+
+	// SvPositionForMaterialCoord is the SvPosition for primary sample, but is PixelCoord for overflow sample
+	float2 ScreenJitter = GetScreenTileJitter();
+	uint2 SvPositionForMaterialCoord = min(ReflectionTracingCoord.xy * ReflectionDownsampleFactor + uint2(ScreenJitter + .5f) + View.ViewRectMinAndSize.xy, View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw - 1);
+
+	if (bIsValid)
+	{
+		const FLumenMaterialCoord Coord = GetLumenMaterialCoord_Reflection(SvPositionForMaterialCoord, TileData);
+		const FLumenMaterialData Material = ApplySmoothBias(ReadMaterialData(Coord, MaxRoughnessToTrace), true /*bTopLayerRoughness*/);
+
+		float DownsampledDepth = Material.SceneDepth;
+
+		if (NeedRayTracedReflections(Material.TopLayerRoughness, Material))
+		{
+			float2 ScreenUV = (Coord.SvPosition + .5f) * View.BufferSizeAndInvSize.zw;
+			float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, Material.SceneDepth);
+			float3 CameraVector = GetCameraVectorFromTranslatedWorldPosition(TranslatedWorldPosition);
+
+			float3 RayDirection;
+			float ConeAngle = 0.0f;
+			bool bMirrorReflectionDebug = false;
+			float3 V = -CameraVector;
+
+			// Use Substrate sampling routine only for opaque surface. 
+			// When FontLayerTranslucency is enable, LumenMaterial is built from custom packed data (i.e., non-Substrate)
+		#if SUBSTRATE_ENABLED && !FRONT_LAYER_TRANSLUCENCY
+			{
+				FSubstrateAddressing SubstrateAddressing = GetSubstratePixelDataByteOffset(Coord.SvPosition, uint2(View.BufferSizeAndInvSize.xy), Substrate.MaxBytesPerPixel);
+				const FSubstratePixelHeader SubstratePixelHeader = UnpackSubstrateHeaderIn(Substrate.MaterialTextureArray, SubstrateAddressing, Substrate.TopLayerTexture);
+				const FSubstrateIntegrationSettings Settings = InitSubstrateIntegrationSettings(false /*bForceFullyRough*/, Substrate.bRoughDiffuse, Substrate.PeelLayersAboveDepth, Substrate.bRoughnessTracking);
+
+				if (Coord.ClosureIndex > 0)
+				{
+					const uint OffsetAddress = UnpackClosureOffsetAtIndex(Substrate.ClosureOffsetTexture[Coord.SvPosition], Coord.ClosureIndex, SubstratePixelHeader.ClosureCount);
+					SubstrateSeekClosure(SubstrateAddressing, OffsetAddress);
+				}
+				FSubstrateBSDF BSDF = UnpackSubstrateBSDF(Substrate.MaterialTextureArray, SubstrateAddressing, SubstratePixelHeader);
+
+				// We set slabs BSDFs as having a single specular lob without haziness.
+				// This is to ensure the pdf is computed from a single lobe in order to be able to compute a matching cone angle.
+				BSDF.SubstrateSetBSDFRoughness(Material.TopLayerRoughness);
+				if (SubstrateGetBSDFType(BSDF) == SUBSTRATE_BSDF_TYPE_SLAB)
+				{
+					BSDF_SETHASHAZINESS(BSDF, 0);
+				}
+
+				const FSubstrateBSDFContext Context = SubstrateCreateBSDFContext(SubstratePixelHeader, BSDF, SubstrateAddressing, V);
+				const float2 E = GenerateRandom(ReflectionTracingCoord.xy);
+				const FBxDFSample Sample = SubstrateImportanceSampleBSDF(Context, E, SHADING_TERM_SPECULAR, Settings);
+
+				RayDirection = normalize(Sample.L);
+				ConeAngle = 1.0f / max(Sample.PDF, 0.0001f);
+			}
+		#else
+			if (Material.TopLayerRoughness < 0.001f || bMirrorReflectionDebug)
+			{
+				RayDirection = reflect(CameraVector, Material.WorldNormal);
+			}
+			else
+			{
+				const float2 E = GenerateRandom(ReflectionTracingCoord.xy);
+
+				float3x3 TangentBasis = GetTangentBasis(Material);
+				float3 TangentV = mul(TangentBasis, V);
+
+				float2 Alpha = Pow2(Material.TopLayerRoughness).xx;
+
+				if (HasAnisotropy(Material))
+				{
+					GetAnisotropicRoughness(Alpha.x, Material.Anisotropy, Alpha.x, Alpha.y);
+				}
+
+				float4 GGXSample = ImportanceSampleVisibleGGX(E, Alpha, TangentV);
+				float3 WorldH = mul(GGXSample.xyz, TangentBasis);
+				RayDirection = reflect(CameraVector, WorldH);
+				ConeAngle = 1.0f / max(GGXSample.w, 0.0001f);
+			}
+		#endif
+
+			ConeAngle = max(ConeAngle, MinReflectionConeAngle);
+			RWRayBuffer[ReflectionTracingCoord] = float4(RayDirection, ConeAngle);
+
+			float TraceDistance = MaxTraceDistance;
+			bool bUseRadianceCache = false;
+		#if RADIANCE_CACHE
+			float RadianceCacheConeHalfAngle = RadianceCacheAngleThresholdScale * acosFast(1.0f - 1 / (float)(RadianceProbeResolution * RadianceProbeResolution));
+
+			if (ConeAngle > RadianceCacheConeHalfAngle)
+			{
+				float3 WorldPosition = TranslatedWorldPosition - DFHackToFloat(PrimaryView.PreViewTranslation); // LUMEN_LWC_TODO
+				FRadianceCacheCoverage Coverage = GetRadianceCacheCoverageWithUncertainCoverage(WorldPosition, RayDirection, InterleavedGradientNoise(ReflectionTracingCoord.xy, ReflectionsStateFrameIndexMod8));
+				bUseRadianceCache = Coverage.bValid;
+				if (bUseRadianceCache)
+				{
+					float FadeAlpha = saturate((ConeAngle - RadianceCacheConeHalfAngle) / RadianceCacheConeHalfAngle);
+					TraceDistance = lerp(.99f * MaxTraceDistance, min(Coverage.MinTraceDistanceBeforeInterpolation, .99f * MaxTraceDistance), FadeAlpha);
+				}
+			}
+		#endif
+
+			RWRayTraceDistance[ReflectionTracingCoord] = PackRayTraceDistance(TraceDistance, bUseRadianceCache);
+		}
+		else
+		{
+			// Store invalid ray in sign bit
+			DownsampledDepth *= -1.0f;
+		}
+
+		RWDownsampledDepth[ReflectionTracingCoord] = DownsampledDepth;
+	}
+#if SUBSTRATE_ENABLED
+	// Check at the tile level if there are several BSDFs
+	else if (TileData.ClosureIndex > 0)
+	{
+		RWDownsampledDepth[ReflectionTracingCoord] = 0;
+	}
+#endif
+}

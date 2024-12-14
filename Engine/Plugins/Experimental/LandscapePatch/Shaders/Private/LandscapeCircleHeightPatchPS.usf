@@ -1,0 +1,66 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/Landscape/LandscapeCommon.ush"
+
+float3 InCenter;
+float InRadius;
+float InFalloff;
+Texture2D<float4> InSourceTexture;
+uint2 InSourceTextureOffset;
+
+#if CIRCLE_HEIGHT_PATCH
+
+void ApplyLandscapeCircleHeightPatch(in float4 SVPos : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float KINDA_SMALL_NUMBER = 0.0001;
+	const float ClampedFalloff = max(InFalloff, KINDA_SMALL_NUMBER);
+	
+	int2 DestinationTextureCoordinates = floor(SVPos.xy);
+	int2 SourceTextureCoordinates = DestinationTextureCoordinates - InSourceTextureOffset;
+	float4 CurrentPackedHeight = InSourceTexture.Load(int3(SourceTextureCoordinates, 0));
+	float CurrentHeight = UnpackHeight(CurrentPackedHeight.xy);
+	
+	float PatchHeight = InCenter.z;
+	
+	float Distance = distance(DestinationTextureCoordinates, InCenter.xy);
+	
+	float Alpha = 1.0;
+	if (Distance > InRadius)
+	{
+		Alpha = 1 - min((Distance - InRadius) / ClampedFalloff, 1.0);
+	}
+	
+	float NewHeight = lerp(CurrentHeight, PatchHeight, Alpha);
+	
+	OutColor = float4(PackHeight(NewHeight), 0.0, 0.0);
+}
+
+#endif // CIRCLE_HEIGHT_PATCH
+
+#if CIRCLE_VISIBILITY_PATCH
+
+void ApplyLandscapeCircleVisibilityPatch(in float4 SVPos : SV_POSITION, out float OutColor : SV_Target0)
+{
+	int2 DestinationTextureCoordinates = floor(SVPos.xy);
+	int2 SourceTextureCoordinates = DestinationTextureCoordinates - InSourceTextureOffset;
+	float Distance = distance(DestinationTextureCoordinates, InCenter.xy);
+	
+	float4 CurrentWeight = InSourceTexture.Load(int3(SourceTextureCoordinates, 0)).x;
+
+	if (Distance <= InRadius)
+	{
+		// TODO: This should be changed to calculate alpha just like a height patch and write out
+		//  the alpha value, which allows for smoother holes. But needs to be changed in a
+		//  separate CL with a fixup to set the falloff of older assets to 0 to keep them unchanged.
+		OutColor = 255.f;
+	}
+	else
+	{
+		OutColor = CurrentWeight.x;
+	}
+}
+
+#endif // CIRCLE_VISIBILITY_PATCH

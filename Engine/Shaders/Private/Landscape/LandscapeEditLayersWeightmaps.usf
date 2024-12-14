@@ -1,0 +1,242 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+
+// ----------------------------------------------------------------------------------
+
+#if defined (__INTELLISENSE__)
+// Uncomment the appropriate define for enabling syntax highlighting with HLSL Tools for Visual Studio : 
+//#define MERGE_EDIT_LAYER 1
+//#define PERFORM_LEGACY_WEIGHT_BLENDING 1
+#define PACK_WEIGHTMAP 1
+//#define GENERATE_MIPS 1
+#endif // defined (__INTELLISENSE__)
+
+
+// ----------------------------------------------------------------------------------
+
+/** EEditLayerWeightmapBlendMode enum */
+#define EEDITLAYERWEIGHTMAPBLENDMODE_ADDITIVE 0
+#define EEDITLAYERWEIGHTMAPBLENDMODE_SUBTRACTIVE 1
+
+/** EWeightmapPaintLayerFlags enum */
+#define EWEIGHTMAPPAINTLAYERFLAGS_ISVISIBILITYLAYER (1 << 0)
+#define EWEIGHTMAPPAINTLAYERFLAGS_ISWEIGHTBLENDED (1 << 1)
+
+#if MERGE_EDIT_LAYER
+// MergeEditLayerPS inputs/outputs :
+
+uint InPaintLayerIndex; // Index of the paint layer being processed
+uint InEditLayerPaintLayerBlendMode; // See EEditLayerWeightmapBlendMode. Paint layer's blend mode, which is per-edit layer and per-paint layer and can therefore differ from one edit layer to another
+float InEditLayerAlpha; // Global alpha value of the edit layer currently being merged
+
+Texture2DArray<float> InCurrentEditLayerWeightmaps; // The paint layers of the current edit layer to merge (1 slice per weightmap in the render group)
+Texture2DArray<float> InPreviousEditLayersWeightmaps; // The result from the merge of all prior edit layers (1 slice per weightmap in the render group)
+// Array that contains per-edit layer / per-paint layer information (e.g. the paint layer's blend mode, which is per-edit layer and can therefore differ from one edit layer to another)
+#endif // MERGE_EDIT_LAYER
+
+#if PERFORM_LEGACY_WEIGHT_BLENDING
+// PerformLegacyWeightBlendingPS inputs/outputs :
+
+// Per-paint layer information : 
+struct FWeightmapPaintLayerInfo
+{
+	uint Flags; // See EWeightmapPaintLayerFlags
+};
+
+uint InPaintLayerIndex; // Index of the paint layer being processed
+uint InNumPaintLayers; // Number of paint layers (i.e. == InPaintLayerInfos.Num())
+// Array that contains per-paint layer information (e.g. paint layer's flags)
+StructuredBuffer<FWeightmapPaintLayerInfo> InPaintLayerInfos;
+Texture2DArray<float> InCurrentEditLayerWeightmaps; // The texture to horizontally blend (1 slice per weightmap in the render group)
+#endif // PERFORM_LEGACY_WEIGHT_BLENDING
+
+#if PACK_WEIGHTMAP
+// PackWeightmapPS inputs/outputs :
+
+int4 InSourceSliceIndices; // For each channel of the output texture (rgba), this indicates the slice index in InSourceWeightmaps where to read from
+uint4 InSourcePixelOffsets[4];  // For each channel, offset to add to the pixel's coordinates to load the proper sample in InSourceWeightmaps (.xy, .zw is unused, only there for alignment purposes)
+uint2 InSubsectionPixelOffset; // Offset of the subsection currently being rendered
+uint InIsAdditive; // = 1 if some channels of this texture have been packed in a previous draw, 0 otherwise
+
+Texture2DArray<float> InSourceWeightmaps; // Source, single-channel, texture to pack
+Texture2D<float4> InWeightmapBeingPacked; // The weightmap being packed, in case the packing operation is additive, i.e. it occurs across multiple draws (contains the channels that have previously been packed)
+#endif // PACK_WEIGHTMAP
+
+#if GENERATE_MIPS
+// GenerateMipsPS inputs/outputs :
+
+uint2 InCurrentMipSubsectionSize; // Size of the the subsection at the currently generated mip level
+
+Texture2D<float4> InSourceWeightmap; // Source weightmap (containing the current mip level - 1)
+#endif // GENERATE_MIPS
+
+
+// ----------------------------------------------------------------------------------
+// Util functions : 
+
+#if PERFORM_LEGACY_WEIGHT_BLENDING
+bool IsWeightBlendedPaintLayer(FWeightmapPaintLayerInfo InPaintLayerInfo)
+{
+	// For the visibility layer, deactivate weight blending altogether : 
+	return (((InPaintLayerInfo.Flags & EWEIGHTMAPPAINTLAYERFLAGS_ISVISIBILITYLAYER) == 0)
+		&& (InPaintLayerInfo.Flags & EWEIGHTMAPPAINTLAYERFLAGS_ISWEIGHTBLENDED));
+}
+#endif // PERFORM_LEGACY_WEIGHT_BLENDING
+
+
+// ----------------------------------------------------------------------------------
+// Pixel shaders : 
+
+#if MERGE_EDIT_LAYER
+void MergeEditLayerPS(in float4 SVPos : SV_POSITION, out float OutWeight : SV_Target0)
+{
+	uint2 TextureCoordinates = floor(SVPos.xy);
+		
+	float CurrentLayerWeight = InCurrentEditLayerWeightmaps.Load(int4(TextureCoordinates, InPaintLayerIndex, 0)); // xy = relative coordinates, z = index in texture array, w = mip level
+	float PreviousLayersWeight = InPreviousEditLayersWeightmaps.Load(int4(TextureCoordinates, InPaintLayerIndex, 0)); // xy = relative coordinates, z = index in texture array, w = mip level
+	OutWeight = PreviousLayersWeight;
+	
+	if (InEditLayerPaintLayerBlendMode == EEDITLAYERWEIGHTMAPBLENDMODE_ADDITIVE)
+	{
+		OutWeight += CurrentLayerWeight;
+	}
+	else if (InEditLayerPaintLayerBlendMode == EEDITLAYERWEIGHTMAPBLENDMODE_SUBTRACTIVE)
+	{
+		OutWeight -= CurrentLayerWeight;
+	}
+}
+#endif // MERGE_EDIT_LAYER
+
+#if PERFORM_LEGACY_WEIGHT_BLENDING
+void PerformLegacyWeightBlendingPS(in float4 SVPos : SV_POSITION, out float OutColor : SV_Target0)
+{
+	uint2 TextureCoordinates = floor(SVPos.xy);
+	OutColor = 0.0f;
+	
+	FWeightmapPaintLayerInfo ActivePaintLayerInfo = InPaintLayerInfos[InPaintLayerIndex];
+	if (!IsWeightBlendedPaintLayer(ActivePaintLayerInfo))
+	{
+		OutColor = InCurrentEditLayerWeightmaps.Load(int4(TextureCoordinates, InPaintLayerIndex, 0)); // xy = relative coordinates, z = index in texture array, w = mip level
+	}
+	else
+	{
+		float ActivePaintLayerWeight = 0.0f;
+		float BlendedWeightsSum = 0.0f;
+
+		LOOP
+		for (int i = 0; i < InNumPaintLayers; ++i)
+		{
+			bool bIsOutputPaintLayer = (i == InPaintLayerIndex);
+			FWeightmapPaintLayerInfo PaintLayerInfo = InPaintLayerInfos[i];
+
+			// Only weight blended (and non-visibility) paint layers participate to weight blending : 
+			if (IsWeightBlendedPaintLayer(PaintLayerInfo))
+			{
+				float Weight = InCurrentEditLayerWeightmaps.Load(int4(TextureCoordinates, i, 0)); // xy = relative coordinates, z = index in texture array, w = mip level
+				if (bIsOutputPaintLayer)
+				{
+					ActivePaintLayerWeight = Weight;
+				}
+				BlendedWeightsSum += Weight;
+			}
+		}
+
+		OutColor = (BlendedWeightsSum > 0.0f) ? saturate(ActivePaintLayerWeight / BlendedWeightsSum) : ActivePaintLayerWeight;
+	}
+}
+#endif // PERFORM_LEGACY_WEIGHT_BLENDING
+
+// ----------------------------------------------------------------------------------
+
+#if PACK_WEIGHTMAP
+void PackWeightmapPS(in float4 SVPos : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	uint2 LocalCoordinates = floor(SVPos.xy);
+	uint2 SubsectionRelativeTextureCoordinates = LocalCoordinates - InSubsectionPixelOffset;
+	OutColor = 0.0f;
+	
+	if (InIsAdditive != 0)
+	{
+		OutColor = InWeightmapBeingPacked.Load(int3(LocalCoordinates, 0)); // xy = relative coordinates, z = mip level
+	}
+	
+	UNROLL
+	for (uint i = 0; i < 4; ++i)
+	{
+		if (InSourceSliceIndices[i] >= 0)
+		{
+			uint2 TextureCoordinates = SubsectionRelativeTextureCoordinates + InSourcePixelOffsets[i].xy;
+			OutColor[i] = InSourceWeightmaps.Load(int4(TextureCoordinates, InSourceSliceIndices[i], 0)); // xy = relative coordinates, z = index in texture array, w = mip level
+		}
+	}
+}
+#endif // PACK_WEIGHTMAP
+
+
+// ----------------------------------------------------------------------------------
+#if GENERATE_MIPS
+void GenerateMipsPS(in float4 SVPos : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	uint2 TextureCoordinates = floor(SVPos.xy);
+	
+	float4 SourceSamples[4] =
+	{
+		InSourceWeightmap.Load(int3(2 * TextureCoordinates + int2(+0, +0), 0)),
+		InSourceWeightmap.Load(int3(2 * TextureCoordinates + int2(+1, +0), 0)),
+		InSourceWeightmap.Load(int3(2 * TextureCoordinates + int2(+0, +1), 0)),
+		InSourceWeightmap.Load(int3(2 * TextureCoordinates + int2(+1, +1), 0)),
+	};
+		
+	// Because the borders of each landscape subsection are shared between neighbors, we must ensure that the parent mip's inner row/column of pixels don't contribute, 
+	//  so that pixels on the subsection borders for neighboring subsections for mips have an equal value : 
+	//  9 possible cases (only the samples marked with a * must be kept): 
+	//      bIsMinBorder.x = true
+	//     |                        bIsMaxBorder.x = true
+	//     |                       |
+	//     v                       v
+	// +-------+   +-------+   +-------+
+	// | * :   |   | * : * |   |   : * |
+	// | - + - |...| - + - |...| - + - | <-- bIsMinBorder.y = true
+	// |   :   |   |   :   |   |   :   |
+	// +-------+   +-------+   +-------+
+	//    ...         ...	      ...
+	// +-------+   +-------+   +-------+
+	// | * :   |   | * : * |   |   : * |
+	// | - + - |...| - + - |...| - + - |
+	// | * :   |   | * : * |   |   : * |
+	// +-------+   +-------+   +-------+
+	//    ...         ...	      ...
+	// +-------+   +-------+   +-------+
+	// |   :   |   |   :   |   |   :   |
+	// | - + - |...| - + - |...| - + - | <-- bIsMaxBorder.y = true
+	// | * :   |   | * : * |   |   : * | 
+	// +-------+   +-------+   +-------+
+
+	bool bIsLastMip = all(InCurrentMipSubsectionSize == 1);
+
+	uint2 SubsectionRelativeTextureCoordinates = TextureCoordinates % InCurrentMipSubsectionSize;
+	bool2 bIsMinBorder = (SubsectionRelativeTextureCoordinates == 0);
+	bool2 bIsMaxBorder = (SubsectionRelativeTextureCoordinates == (InCurrentMipSubsectionSize - 1));
+		
+	float SampleWeights[4] =
+	{ 
+		// On the last mip, it's ok to keep all 4 samples : all neighbors components share them : 
+		((bIsMaxBorder.x || bIsMaxBorder.y) && !bIsLastMip) ? 0.0f : 1.0f,
+		((bIsMinBorder.x || bIsMaxBorder.y) && !bIsLastMip) ? 0.0f : 1.0f,
+		((bIsMaxBorder.x || bIsMinBorder.y) && !bIsLastMip) ? 0.0f : 1.0f,
+		((bIsMinBorder.x || bIsMinBorder.y) && !bIsLastMip) ? 0.0f : 1.0f,
+	};
+	
+	float TotalSampleWeight = 0.0f;
+	OutColor = 0.0f;
+	
+	UNROLL
+	for (int i = 0; i < 4; ++i)
+	{
+		OutColor += SourceSamples[i] * SampleWeights[i];
+		TotalSampleWeight += SampleWeights[i];
+	}
+	OutColor /= TotalSampleWeight;
+}
+#endif // GENERATE_MIPS

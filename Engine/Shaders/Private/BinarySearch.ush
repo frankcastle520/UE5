@@ -1,0 +1,64 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+template<typename T>
+struct TDefaultCompare
+{
+	int Compare(T a, T b)
+	{
+		return int(a > b) - int(a < b);
+	}
+};
+
+// BufferCount must be a power of 2
+template<typename TBuffer, typename T, typename TCompare>
+T LowerBound(TBuffer SearchBuffer, uint BufferOffset, uint BufferCount, T Key)
+{
+	TCompare Comp = (TCompare)0;
+	uint Index = BufferOffset;
+	uint Width = BufferCount >> 1;
+	
+	while (Width > 0)
+	{
+		Index += Comp.Compare(Key, SearchBuffer[Index + Width]) < 0 ? 0 : Width;
+		Width = Width >> 1;
+	}
+	
+	return Index;
+}
+
+// BufferCount must be a power of 2
+template<typename TBuffer, typename T, typename TCompare>
+bool BinarySearch(TBuffer SearchBuffer, uint BufferOffset, uint BufferCount, T Key, inout uint OutIndex)
+{
+	if (BufferCount == 0)
+	{
+		return false;
+	}
+	OutIndex = LowerBound<TBuffer, T, TCompare>(SearchBuffer, BufferOffset, BufferCount, Key);
+	return SearchBuffer[OutIndex] == Key;
+}
+
+// BufferCount must be a power of 2
+template<typename TBuffer, typename T, typename TCompare>
+bool BinarySearch(TBuffer SearchBuffer, uint BufferOffset, uint BufferCount, T Key)
+{
+	uint Index;
+	return BinarySearch<TBuffer, T, TCompare>(SearchBuffer, BufferOffset, BufferCount, Key, Index);
+}
+
+// BufferCount must be a power of 2
+template<typename TBuffer, typename T>
+bool BinarySearch(TBuffer SearchBuffer, uint BufferOffset, uint BufferCount, T Key, inout uint OutIndex)
+{
+	return BinarySearch< TBuffer, T, TDefaultCompare<T> >(SearchBuffer, BufferOffset, BufferCount, Key, OutIndex);
+}
+
+// BufferCount must be a power of 2
+template<typename TBuffer, typename T>
+bool BinarySearch(TBuffer SearchBuffer, uint BufferOffset, uint BufferCount, T Key)
+{
+	uint Index;
+	return BinarySearch<TBuffer, T>(SearchBuffer, BufferOffset, BufferCount, Key, Index);
+}

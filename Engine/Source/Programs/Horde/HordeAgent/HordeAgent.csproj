@@ -1,0 +1,221 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+	<ApplicationIcon>HordeAgent.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>HordeAgent</AssemblyName>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>false</EmbedUntrackedSources>
+    <DebugType>pdbonly</DebugType>
+    <Configurations>Debug;Release;Analyze</Configurations>
+    <NoWarn>1701;1702;NU3003</NoWarn>
+    <RunAnalyzersDuringBuild>False</RunAnalyzersDuringBuild>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <DocumentationFile>HordeAgent.xml</DocumentationFile>
+    <TreatWarningsAsErrors>False</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Analyze|AnyCPU' ">
+    <RunAnalyzersDuringBuild>True</RunAnalyzersDuringBuild>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>True</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <DocumentationFile></DocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="HordeAgent.xml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.Core" Version="3.7.300.12" />
+    <PackageReference Include="AWSSDK.EC2" Version="3.7.306.6" />
+    <PackageReference Include="AWSSDK.SimpleSystemsManagement" Version="3.7.301.8" />
+    <PackageReference Include="Google.Protobuf" Version="3.25.1" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.59.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.59.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Meziantou.Analyzer" Version="2.0.139">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Http.Polly" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Options.DataAnnotations" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Management.Infrastructure" Version="3.0.0" />
+    <PackageReference Include="Microsoft.VisualStudio.Threading.Analyzers" Version="17.8.14">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="OpenTelemetry" Version="1.8.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.8.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.8.0" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.8.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.GrpcNetClient" Version="1.8.0-beta.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.8.1" />
+    <PackageReference Include="Serilog" Version="3.1.1" />
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Extensions.Logging" Version="8.0.0" />
+    <PackageReference Include="Serilog.Settings.Configuration" Version="8.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="8.0.0" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="appsettings.json" Condition="Exists('appsettings.json')">
+      <Generator></Generator>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
+    <Content Include="appsettings.Development.json" Condition="Exists('appsettings.Development.json')">
+      <Generator></Generator>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <DependentUpon>appsettings.json</DependentUpon>
+    </Content>
+    <Content Include="appsettings.Local.json" Condition="Exists('appsettings.Local.json')">
+      <Generator></Generator>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <DependentUpon>appsettings.json</DependentUpon>
+    </Content>
+    <Content Include="appsettings.Production.json" Condition="Exists('appsettings.Production.json')">
+      <Generator></Generator>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <DependentUpon>appsettings.json</DependentUpon>
+    </Content>
+    <Content Include="appsettings.User.json" Condition="Exists('appsettings.User.json')">
+      <Generator></Generator>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <DependentUpon>appsettings.json</DependentUpon>
+    </Content>
+    <Content Include="Defaults\agent.json">
+      <Generator></Generator>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\*.proto">
+      <Link>Protos\%(FileName)%(Extension)</Link>
+    </Content>
+    <Content Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\common\**\*.proto">
+      <Link>Protos\horde\common\%(RecursiveDir)%(FileName)%(Extension)</Link>
+    </Content>
+    <Compile Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\agent_capabilities.proto.cs">
+      <Link>Protos\horde\messages\agent_capabilities.proto.cs</Link>
+    </Compile>
+    <Compile Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\lease.proto.cs">
+      <Link>Protos\horde\messages\lease.proto.cs</Link>
+    </Compile>
+    <Content Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\**\*.proto">
+      <Link>Protos\horde\messages\%(RecursiveDir)%(FileName)%(Extension)</Link>
+    </Content>
+    <Content Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\**\*.proto">
+      <Link>Protos\horde\tasks\%(RecursiveDir)%(FileName)%(Extension)</Link>
+    </Content>
+<!--    
+    <Compile Include="..\HordeServer\Protos\horde\**\*.cs">
+      <Link>Protos\horde\%(RecursiveDir)%(FileName)%(Extension)</Link>
+    </Compile>
+    -->
+    <Compile Include="$(IntermediateOutputPath)VersionInfo.cs">
+      <Link>Properties/VersionInfo.cs</Link>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Shared\EpicGames.Core\EpicGames.Core.csproj" />
+    <ProjectReference Include="..\..\Shared\EpicGames.Horde\EpicGames.Horde.csproj" />
+    <ProjectReference Include="..\..\Shared\EpicGames.Perforce.Managed\EpicGames.Perforce.Managed.csproj" />
+    <ProjectReference Include="..\..\Shared\EpicGames.Perforce\EpicGames.Perforce.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\horde_rpc.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" GrpcServices="Client" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\horde_rpc_messages.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\enrollment_rpc.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" GrpcServices="Client" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\enrollment_rpc_messages.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\common\agent_status.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\common\lease_outcome.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\common\lease_state.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\agent_capabilities.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\agent_requirements.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\lease.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\aws_lambda.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\compute_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\restart_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\shutdown_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\test_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\upgrade_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+
+    <Protobuf Include="..\Plugins\Build\HordeServer.Build\Protos\horde\job_rpc_messages.proto" ProtoRoot="..\Plugins\Build\HordeServer.Build\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Build\HordeServer.Build\Protos\horde\common\label_change.proto" ProtoRoot="..\Plugins\Build\HordeServer.Build\Protos" Access="Public" AdditionalImportDirs="..\Plugins\Compute\HordeServer.Compute\Protos" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\messages\agent_workspace.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\conform_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" />
+    <Protobuf Include="..\Plugins\Compute\HordeServer.Compute\Protos\horde\tasks\job_task.proto" ProtoRoot="..\Plugins\Compute\HordeServer.Compute\Protos" Access="Public" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Update="Properties\Resources.Designer.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Resources.resx</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Update="appsettings.Local.json" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+
+  <Target Name="PublishSymbols" AfterTargets="AfterBuild" Condition="'$(FullSymbolsDir)' != ''">
+    <ItemGroup>
+      <OutputFiles Include="$(OutDir)**" />
+      <BinaryFilesBase Include="$(OutDir)\*.dll" />
+      <BinaryFilesBase Include="$(OutDir)\*.pdb" />
+      <BinaryFiles Include="@(BinaryFilesBase)" />
+    </ItemGroup>
+
+    <MakeDir Directories="$(FullSymbolsDir)" />
+    <Copy SourceFiles="@(Files)" DestinationFolder="$(FullSymbolsDir)" />
+  </Target>
+
+  <!-- Encode version in a source file as inferring version from assemblies is unreliable on platform-specific binaries -->
+  <Target Name="PrepareVersionInfo" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <TemplateFile>Utility/VersionInfo.cs.template</TemplateFile>
+      <OutputFile>$(IntermediateOutputPath)/VersionInfo.cs</OutputFile>
+    </PropertyGroup>
+    <ReadLinesFromFile File="$(TemplateFile)">
+      <Output TaskParameter="Lines" ItemName="Lines" />
+    </ReadLinesFromFile>
+    <WriteLinesToFile File="$(OutputFile)" Lines="@(Lines-&gt;Replace('$VERSION$', '$(InformationalVersion)'))" Overwrite="true" Encoding="UTF-8" />
+  </Target>
+  
+</Project>

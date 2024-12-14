@@ -1,0 +1,20 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "SceneData.ush"
+
+uint2 GetMeshPaintTextureDescriptor(FPrimitiveSceneData PrimitiveData)
+{
+	return PrimitiveData.MeshPaintTextureDescriptor;
+}
+
+uint GetMeshPaintTextureCoordinateIndex(FPrimitiveSceneData PrimitiveData)
+{
+	return GetMeshPaintTextureDescriptor(PrimitiveData).y >> 30;
+}
+
+bool GetMeshPaintTextureDescriptorIsValid(FPrimitiveSceneData PrimitiveData)
+{
+	return GetMeshPaintTextureDescriptor(PrimitiveData).x != 0;
+}

@@ -1,0 +1,1080 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#ifndef NUM_SAMPLES_PER_PIXEL_1D
+	#define NUM_SAMPLES_PER_PIXEL_1D 1
+#endif
+
+#define SUPPORT_CONTACT_SHADOWS 0 
+
+#ifndef USE_RECT_LIGHT
+	#define USE_RECT_LIGHT 0
+#endif
+
+#if USE_RECT_LIGHT
+	#define USE_SOURCE_TEXTURE 1
+#endif
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "../MegaLights/MegaLights.ush"
+#include "../MegaLights/MegaLightsRayTracing.ush"
+#include "../DeferredLightingCommon.ush"
+#include "../IntersectionUtils.ush"
+#include "../ShaderPrint.ush"
+
+#if SHADER_STANDALONE_EVALUATE
+  #if LIGHT_FUNCTION
+	#include "/Engine/Generated/Material.ush"
+	#include "../LightFunctionCommon.ush"
+  #endif
+  #if USE_CLOUD_TRANSMITTANCE
+	#include "../VolumetricCloudCommon.ush"
+  #endif
+#endif // SHADER_STANDALONE_EVALUATE
+
+#include "LumenCardCommon.ush"
+#include "LumenCardTile.ush"
+#include "LumenSceneLighting.ush"
+#include "LumenSceneDirectLighting.ush"
+#include "SurfaceCache/LumenSurfaceCache.ush" 
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper functions
+
+// Transient atlas coord used for storing card tile data during the update pass. 
+// The coord are only valid for the current frame. These atlas coords are allocated with a simple 
+// linear allocator
+struct FTransientCoord
+{
+	uint2 TileCoord;
+	uint2 TexelCoord;
+	uint2 BaseTexelCoord;
+	uint2 TexelCoordWithinTile;
+};
+
+uint2 GetTile1dToTile2D(uint LinearTileIndex)
+{
+	//return uint2(LinearTileIndex & 0x7F, LinearTileIndex >> 7u);
+	return uint2(LinearTileIndex % 128u, LinearTileIndex / 128u);
+}
+
+FTransientCoord GetTransientCoord(uint LinearTileIndex, uint2 GroupThreadId)
+{
+	FTransientCoord Out;
+	Out.TileCoord = GetTile1dToTile2D(LinearTileIndex);
+	Out.TexelCoord = Out.TileCoord * CARD_TILE_SIZE + GroupThreadId.xy;
+	Out.BaseTexelCoord = Out.TileCoord * CARD_TILE_SIZE;
+	Out.TexelCoordWithinTile = GroupThreadId.xy;
+	return Out;
+}
+
+// Init debug context for the texel under the mouse cursor
+FShaderPrintContext InitDebugContext(StructuredBuffer<uint> InLumenSceneDebugData, FCardTileData InCardTile, FLumenCardPageData InCardPage, float2 InAtlasUV, uint2 InStartCoord = uint2(50, 50))
+{
+	FShaderPrintContext Out = InitShaderPrintContext(false, 0);
+	const FLumenSceneDebugData DebugData = ReadDebugData(InLumenSceneDebugData);
+	if (DebugData.bValid && DebugData.CardPageIndex == InCardTile.CardPageIndex)
+	{
+		const bool bDebug = all(uint2(DebugData.PhysicalAtlasUV/InCardPage.PhysicalAtlasUVTexelScale) == uint2(InAtlasUV/InCardPage.PhysicalAtlasUVTexelScale));
+		if (bDebug)
+		{
+			Out = InitShaderPrintContext(true, InStartCoord);
+		}
+	}
+	return Out;
+}
+
+struct FLightTargetPDF
+{
+	float3 Diffuse;
+	float Weight;
+};
+
+FLightTargetPDF InitLightTargetPDF()
+{
+	FLightTargetPDF LightTargetPDF;
+	LightTargetPDF.Diffuse = 0.0f;
+	LightTargetPDF.Weight = 0.0f;
+	return LightTargetPDF;
+}
+
+FLightTargetPDF GetLocalLightTargetPDF(FDeferredLightData LightData, float3 TranslatedWorldPosition, float3 WorldNormal, float Exposure)
+{
+	FLightTargetPDF LightTargetPDF = InitLightTargetPDF();
+	float3 CameraVector = normalize(TranslatedWorldPosition - View.TranslatedWorldCameraOrigin);
+	LightTargetPDF.Diffuse = GetIrradianceForLight(LightData, WorldNormal, TranslatedWorldPosition, USE_RECT_LIGHT);
+
+	#if USE_IES_PROFILE
+	if (LightData.IESAtlasIndex >= 0 && Luminance(LightTargetPDF.Diffuse) > 0.01f)
+	{
+		const float LightProfileMult = ComputeLightProfileMultiplier(TranslatedWorldPosition, LightData.TranslatedWorldPosition, -LightData.Direction, LightData.Tangent, LightData.IESAtlasIndex);
+		LightTargetPDF.Diffuse *= LightProfileMult;
+	}
+	#endif
+
+	#if USE_LIGHT_FUNCTION_ATLAS
+	if (LightData.LightFunctionAtlasLightIndex > 0 && Luminance(LightTargetPDF.Diffuse) > 0.01f)
+	{
+		LightTargetPDF.Diffuse *= GetLocalLightFunctionCommon(TranslatedWorldPosition, LightData.LightFunctionAtlasLightIndex);
+	}
+	#endif
+
+	// Simulate tonemapping
+	LightTargetPDF.Weight = log2(Luminance(LightTargetPDF.Diffuse) + 1.0f);
+
+	return LightTargetPDF;
+}
+
+#if SHADER_GENERATE_SAMPLE || SHADER_SHADING
+FLumenLight GetLumenLightData(uint LightIndex, uint ViewIndex)
+{
+	const FDFVector3 PreViewTranslation = GetPreViewTranslation(ViewIndex);
+	return LoadLumenLight(LightIndex, DFHackToFloat(PreViewTranslation), ViewExposure[ViewIndex]);
+}
+#endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_GENERATE_SAMPLE
+
+bool DoesLightAffectCardPageUVRange(FLumenLight LumenLight, FLumenCardPageData CardPage, FLumenCardData Card, float2 UVMin, float2 UVMax, inout float3 OutCardPageWorldCenter)
+{
+	// Lighting channels test
+	if (!(Card.LightingChannelMask & LumenLight.LightingChannelMask))
+	{
+		return false;
+	}
+
+	float3 CardPageLocalCenter;
+	float3 CardPageLocalExtent;
+	GetCardLocalBBox(CardPage, Card, UVMin, UVMax, CardPageLocalCenter, CardPageLocalExtent);
+
+	float3 CardPageWorldCenter = mul(Card.WorldToLocalRotation, CardPageLocalCenter) + Card.Origin;
+	float3 CardPageWorldExtent = mul(abs(Card.WorldToLocalRotation), CardPageLocalExtent);
+	float CardPageWorldBoundingSphere = length(CardPageLocalExtent);
+	OutCardPageWorldCenter = CardPageWorldCenter;
+
+	float4 InfluenceSphere = LumenLight.InfluenceSphere;
+	float3 LightInfluenceSphereLocalCenter = mul(InfluenceSphere.xyz - Card.Origin, Card.WorldToLocalRotation);
+	const float BoxDistanceSq = ComputeSquaredDistanceFromBoxToPoint(CardPageLocalCenter, CardPageLocalExtent, LightInfluenceSphereLocalCenter);
+	const bool bCardAffectedByInfluenceSphere = BoxDistanceSq < InfluenceSphere.w * InfluenceSphere.w;
+
+	const uint LightType = LumenLight.Type;
+	const float3 LightPosition = LumenLight.ProxyPosition;
+	const float3 LightDirection = LumenLight.ProxyDirection;
+	const float LightRadius = LumenLight.ProxyRadius;
+
+	// Fast out
+	if (LightType != LIGHT_TYPE_DIRECTIONAL && !bCardAffectedByInfluenceSphere)
+	{
+		return false;
+	}
+
+	if (LightType == LIGHT_TYPE_DIRECTIONAL)
+	{
+		return true;
+	}
+	else if (LightType == LIGHT_TYPE_POINT)
+	{
+		// Point light
+		return bCardAffectedByInfluenceSphere;
+	}
+	else if (LightType == LIGHT_TYPE_SPOT)
+	{
+		float CosConeAngle = LumenLight.CosConeAngle;
+		float SinConeAngle = LumenLight.SinConeAngle;
+
+		float ConeAxisDistance = dot(CardPageWorldCenter - LightPosition, LightDirection);
+		float2 ConeAxisDistanceMinMax = float2(ConeAxisDistance + CardPageWorldBoundingSphere, ConeAxisDistance - CardPageWorldBoundingSphere);
+
+		// Spot light
+		return bCardAffectedByInfluenceSphere
+		&& SphereIntersectCone(float4(CardPageWorldCenter, CardPageWorldBoundingSphere), LightPosition, LightDirection, CosConeAngle, SinConeAngle)
+		&& ConeAxisDistanceMinMax.x > 0 && ConeAxisDistanceMinMax.y < LightRadius;
+	}
+	#if USE_RECT_LIGHT
+	else if (LightType == LIGHT_TYPE_RECT)
+	{
+		// Rect light
+		float4 BackPlane = float4(LightDirection, dot(LightPosition, LightDirection));
+		float DistanceFromBoxCenterToPlane = dot(BackPlane.xyz, CardPageWorldCenter) - BackPlane.w;
+		float MaxExtent = dot(CardPageWorldExtent, abs(BackPlane.xyz));
+		bool bInFrontOfPlane = DistanceFromBoxCenterToPlane + MaxExtent > 0.0f;
+		return bCardAffectedByInfluenceSphere && bInFrontOfPlane;
+	}
+	#endif
+
+	// Error: Unknown light type
+	return false;
+}
+
+uint MaxCompositeTiles;
+float SamplingMinWeight;
+uint  NumSamplesPerPixel1d;
+uint NumLights;
+uint NumStandaloneLights;
+uint NumViews;
+uint StateFrameIndex;
+
+RWTexture2D<float4> RWSceneData;
+RWTexture2D<uint> RWUniqueLightIndices;
+RWTexture2D<uint> RWUniqueLightCount;
+RWStructuredBuffer<uint> RWCardTilePerLightCounters;
+
+RWTexture2D<float> RWDiffuseLighting;
+RWTexture2D<float> RWSampleLuminanceSum;
+RWTexture2DArray<uint> RWLightSamples;
+RWTexture2DArray<float4> RWSampleDiffuseLighting;
+
+float4 HistoryScreenPositionScaleBias;
+float4 HistoryUVMinMax;
+
+// Workaround for a console shader compiler bug generating incorrect code. Likely can be removed in next SDK.
+uint DummyZeroForFixingShaderCompilerBug;
+
+groupshared uint SharedCandidateLightCount;
+groupshared uint SharedCandidateLightHiMask;
+groupshared uint SharedCandidateLightMask[SHARED_LIGHT_MASK_SIZE];
+groupshared uint SharedStandaloneLightMask[SHARED_LIGHT_MASK_SIZE];
+
+StructuredBuffer<uint> TileAllocator;
+StructuredBuffer<uint> TileData;
+StructuredBuffer<uint> LumenSceneDebugData;
+
+#define DEBUG_ENABLE 0
+
+#if THREADGROUP_SIZE != 8
+#error The code assume THREADGROUP_SIZE == 8 
+#endif
+#define THREADGROUP_COUNT 64
+/**
+ * Run one thread per sample and generate new light samples for tracing
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void GenerateLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint  LinearThreadIndex : SV_GroupIndex,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (LinearThreadIndex == 0)
+	{
+		SharedCandidateLightHiMask = 0;
+		SharedCandidateLightCount = 0;
+	}
+
+	if (LinearThreadIndex < SHARED_LIGHT_MASK_SIZE)
+	{
+		SharedCandidateLightMask[LinearThreadIndex] = 0;
+		SharedStandaloneLightMask[LinearThreadIndex] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint TileIndex = GroupId.x;
+	if (TileIndex < TileAllocator[0])
+	{
+		uint LocalCandidateLightHiMask = 0;
+
+		// 1. Load cards data
+		const uint CardTileIndex = TileIndex;
+		const FCardTileData CardTile = UnpackCardTileData(TileData[CardTileIndex]);
+		const FLumenCardPageData CardPage = GetLumenCardPageData(CardTile.CardPageIndex + DummyZeroForFixingShaderCompilerBug);
+		const uint2 CoordInCardTile = GroupThreadId.xy;
+		const uint2 TexelInCardPageCoord = CardTile.TileCoord * CARD_TILE_SIZE + CoordInCardTile;
+		const float2 AtlasUV = CardPage.PhysicalAtlasUVRect.xy + CardPage.PhysicalAtlasUVTexelScale * (TexelInCardPageCoord + 0.5f);
+		const float2 CardUV = CardPage.CardUVRect.xy + CardPage.CardUVTexelScale * (TexelInCardPageCoord + 0.5f);
+
+		const FLumenCardData Card = GetLumenCardData(CardPage.CardIndex);
+		const FLumenSurfaceCacheData SurfaceCacheData = GetSurfaceCacheData(Card, CardUV, AtlasUV); 
+
+		const uint2 SizeInTiles = CardPage.SizeInTexels / CARD_TILE_SIZE;
+		float2 UVMin = float2(CardTile.TileCoord) / SizeInTiles;
+		float2 UVMax = float2(CardTile.TileCoord + 1) / SizeInTiles;
+		float SwapY = UVMin.y;
+		UVMin.y = 1.0f - UVMax.y;
+		UVMax.y = 1.0f - SwapY;
+
+		// Debug
+		#if DEBUG_ENABLE
+		FShaderPrintContext Ctx = InitDebugContext(LumenSceneDebugData, CardTile, CardPage, AtlasUV);
+		#endif
+
+		const FTransientCoord TransientCoord = GetTransientCoord(TileIndex, GroupThreadId.xy);
+		const uint ViewIndex = GetCardViewIndex(CardPage, Card, UVMin, UVMax, float2(0, 1), NumViews, true);
+
+		// 2. Cull & Sample lights
+		{
+			// 2.1 Cull lights - 1 light per lane
+			{
+				const uint PassCount = DivideAndRoundUp64(NumLights);
+				for (uint PassIt = 0; PassIt < NumLights; ++PassIt)
+				{
+					const uint LightIndex = LinearThreadIndex + THREADGROUP_COUNT * PassIt;
+					if (LightIndex < NumLights && LightIndex < MAX_LOCAL_LIGHT_INDEX)
+					{
+						const FDFVector3 PreViewTranslation = GetPreViewTranslation(ViewIndex);
+						const FLumenLight LumenLight = LoadLumenLight(LightIndex, DFHackToFloat(PreViewTranslation), ViewExposure[ViewIndex]);
+
+						float3 CardPageWorldCenter = 0.0f; // LWC_TODO:
+						bool bLightAffectsCard = DoesLightAffectCardPageUVRange(LumenLight, CardPage, Card, UVMin, UVMax, CardPageWorldCenter);
+						if (bLightAffectsCard)
+						{
+							uint DWORDIndex = LightIndex / 32;
+							uint BitMask = 1u << (LightIndex % 32);
+							InterlockedOr(SharedCandidateLightMask[DWORDIndex], BitMask);
+							if (LumenLight.bIsStandaloneLight)
+							{
+								InterlockedOr(SharedStandaloneLightMask[DWORDIndex], BitMask);
+							}
+							uint HiBitMask = 1u << DWORDIndex;
+							LocalCandidateLightHiMask |= HiBitMask;
+						}
+					}
+				}
+			}
+
+			uint WaveHiMask = WaveActiveBitOr(LocalCandidateLightHiMask);
+			if (WaveIsFirstLane())
+			{
+				InterlockedOr(SharedCandidateLightHiMask, WaveHiMask);
+			}
+
+			GroupMemoryBarrierWithGroupSync();
+
+			if (LinearThreadIndex < SHARED_LIGHT_MASK_SIZE)
+			{
+				const uint LocalLightCount = countbits(SharedCandidateLightMask[LinearThreadIndex]);
+				InterlockedAdd(SharedCandidateLightCount, LocalLightCount);
+			}
+
+			GroupMemoryBarrierWithGroupSync();
+
+			// 2.2 Sample lights - 1 texel per lane
+			{
+				uint LocalLightIndices[NUM_SAMPLES_PER_PIXEL_1D];
+				float3 SampleDiffuseLighting[NUM_SAMPLES_PER_PIXEL_1D];;
+				FLightSample LightSamples[NUM_SAMPLES_PER_PIXEL_1D];
+				for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++LightSampleIndex)
+				{
+					LightSamples[LightSampleIndex] = InitLightSample();
+					SampleDiffuseLighting[LightSampleIndex] = 0.f;
+					LocalLightIndices[LightSampleIndex] = MAX_LOCAL_LIGHT_INDEX;
+				}
+
+				float3 DiffuseSum = 0.0f;
+				float WeightSum = 0.0f;
+
+				if (SurfaceCacheData.bValid)
+				{
+					const FDFVector3 PreViewTranslation = GetPreViewTranslation(ViewIndex);
+					const float3 TranslatedWorldPosition = SurfaceCacheData.WorldPosition + DFHackToFloat(PreViewTranslation);
+					{
+						// Initialize random variables using spatiotemporal Blue Noise
+						float LightIndexRandom[NUM_SAMPLES_PER_PIXEL_1D];
+						{
+							float RandomScalar = BlueNoiseScalar(TexelInCardPageCoord, StateFrameIndex);
+
+							for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++LightSampleIndex)
+							{
+								LightIndexRandom[LightSampleIndex] = (RandomScalar + LightSampleIndex) / NUM_SAMPLES_PER_PIXEL_1D;
+							}
+						}
+
+						// Iterate through all the light affecting the card tile
+						uint CandidateLightHiMask = SharedCandidateLightHiMask;
+						while (CandidateLightHiMask != 0)
+						{
+							const uint NextHiBitIndex = firstbitlow(CandidateLightHiMask);
+							const uint NextHiBitMask = 1u << NextHiBitIndex;
+							CandidateLightHiMask ^= NextHiBitMask;
+
+							const uint MaskIndex = NextHiBitIndex;
+							uint CandidateLightMask = SharedCandidateLightMask[MaskIndex];
+
+							while (CandidateLightMask != 0)
+							{
+								const uint NextBitIndex = firstbitlow(CandidateLightMask);
+								const uint NextBitMask = 1u << NextBitIndex;
+								CandidateLightMask ^= NextBitMask;
+
+								const uint LocalLightIndex = MaskIndex * 32 + NextBitIndex;
+								const FDeferredLightData LightData = GetLumenLightData(LocalLightIndex, ViewIndex).DeferredLightData;
+				
+								FLightTargetPDF LightTargetPDF = GetLocalLightTargetPDF(LightData, TranslatedWorldPosition, SurfaceCacheData.WorldNormal, ViewExposure[ViewIndex]);
+								if (LightTargetPDF.Weight > SamplingMinWeight)
+								{
+									float Tau = WeightSum / (WeightSum + LightTargetPDF.Weight);
+									WeightSum += LightTargetPDF.Weight;
+									DiffuseSum += LightTargetPDF.Diffuse;
+
+									for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++LightSampleIndex)
+									{
+										if (LightIndexRandom[LightSampleIndex] < Tau)
+										{
+											LightIndexRandom[LightSampleIndex] /= Tau;
+										}
+										else
+										{
+											// Select this sample
+											LightIndexRandom[LightSampleIndex] = (LightIndexRandom[LightSampleIndex] - Tau) / (1.0f - Tau);
+											LightSamples[LightSampleIndex].LocalLightIndex = LocalLightIndex;
+											LightSamples[LightSampleIndex].Weight = LightTargetPDF.Weight;
+											SampleDiffuseLighting[LightSampleIndex] = LightTargetPDF.Diffuse;
+										}
+
+										LightIndexRandom[LightSampleIndex] = clamp(LightIndexRandom[LightSampleIndex], 0, 0.9999f);
+									}
+								}
+							}
+						}
+					}
+
+					// Deduplicate samples selecting the same light
+					#define DEDUPLICATE_SAMPLE 0
+					#if DEDUPLICATE_SAMPLE
+					for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++LightSampleIndex)
+					{
+						LocalLightIndices[LightSampleIndex] = LightSamples[LightSampleIndex].LocalLightIndex;
+					}
+					for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++LightSampleIndex)
+					{
+						for (uint SubLightSampleIndex = LightSampleIndex+1; SubLightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++SubLightSampleIndex)
+						{
+							if (LocalLightIndices[LightSampleIndex] == LocalLightIndices[SubLightSampleIndex])
+							{
+								LocalLightIndices[SubLightSampleIndex] = MAX_LOCAL_LIGHT_INDEX;
+								SampleDiffuseLighting[SubLightSampleIndex] = 0;
+
+								LightSamples[LightSampleIndex].Weight += LightSamples[LightSampleIndex].Weight;
+								SampleDiffuseLighting[LightSampleIndex] += SampleDiffuseLighting[SubLightSampleIndex];
+							}
+						}
+					}
+					#endif
+
+					// Store sample scene data (position, normal, view index) to avoid loading card data during HW tracing
+					RWSceneData[TransientCoord.TexelCoord] = PackLumenSampleSceneData(TranslatedWorldPosition, SurfaceCacheData.WorldNormal, ViewIndex, Card.bHeightfield);
+
+					#if DEBUG_ENABLE
+					if (Ctx.bIsActive)
+					{
+						AddCrossTWS(Ctx, TranslatedWorldPosition, 100.f, ColorYellow);
+						Print(Ctx, TEXT("#Samples   "), FontWhite); Print(Ctx, uint(NUM_SAMPLES_PER_PIXEL_1D), FontYellow); Newline(Ctx);
+						Print(Ctx, TEXT("WeightSum   "), FontWhite); Print(Ctx, WeightSum, FontYellow); Newline(Ctx);
+						Newline(Ctx);
+					}
+					#endif
+
+				} // SurfaceCacheData.bValid
+
+				RWSampleLuminanceSum[TransientCoord.TexelCoord] = Luminance(DiffuseSum);
+
+				for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_PIXEL_1D; ++LightSampleIndex)
+				{
+					FLightSample LightSample = LightSamples[LightSampleIndex];
+					#if DEBUG_ENABLE
+					if (Ctx.bIsActive)
+					{
+						Print(Ctx, TEXT("Sample"), FontRed); Newline(Ctx);
+						Print(Ctx, TEXT("Weight     "), FontWhite); Print(Ctx, LightSample.Weight, FontYellow); Newline(Ctx);
+					}
+					#endif
+
+					#if DEDUPLICATE_SAMPLE 
+					const bool bValid = LocalLightIndices[LightSampleIndex] != MAX_LOCAL_LIGHT_INDEX;
+					#else
+					const bool bValid = LightSample.LocalLightIndex != MAX_LOCAL_LIGHT_INDEX;
+					#endif
+					if (bValid)
+					{
+						const bool bCastShadows = GetLumenLightData(LightSample.LocalLightIndex, ViewIndex).bHasShadowMask;
+
+						LightSample.bVisible = true;
+						LightSample.bCompleted = bCastShadows ? false : true;
+						LightSample.Weight = WeightSum / (NUM_SAMPLES_PER_PIXEL_1D * LightSample.Weight);
+
+						FShaderPrintContext Ctx2 = InitShaderPrintContext(true, uint2(0, 0));
+						uint OutOffset = 0;
+						SHADER_PRINT_INTERLOCKEDADD(SHADER_PRINT_RWENTRYBUFFER(Ctx2, SHADER_PRINT_COUNTER_OFFSET_FREE), 1, OutOffset);
+					}
+					else
+					{
+						LightSample.bVisible = false;
+						LightSample.bCompleted = true;
+						LightSample.Weight = 0;
+					}
+
+					#if DEBUG_ENABLE
+					if (Ctx.bIsActive)
+					{
+						Print(Ctx, TEXT("Weight     "), FontWhite); Print(Ctx, LightSample.Weight, FontYellow); Newline(Ctx);
+						Print(Ctx, TEXT("bVisible   "), FontWhite); Print(Ctx, LightSample.bVisible, FontYellow); Newline(Ctx);
+						Print(Ctx, TEXT("bCompleted "), FontWhite); Print(Ctx, LightSample.bCompleted, FontYellow); Newline(Ctx);
+						Print(Ctx, TEXT("LightIndex "), FontWhite); Print(Ctx, LightSample.LocalLightIndex, FontYellow); Newline(Ctx);
+						Print(Ctx, TEXT("Diffuse    "), FontWhite); Print(Ctx, SampleDiffuseLighting[LightSampleIndex], FontYellow); Newline(Ctx);						
+					}
+					#endif
+
+					RWLightSamples[uint3(TransientCoord.TexelCoord, LightSampleIndex)] = PackLightSample(LightSample);
+					RWSampleDiffuseLighting[uint3(TransientCoord.TexelCoord, LightSampleIndex)] = float4(SampleDiffuseLighting[LightSampleIndex], bValid ? 1 : 0);
+				}
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// 3. Store list of unique (standalone) lights per tile
+		//    Make this parallel, or computed within the loop above
+		if (LinearThreadIndex == 0 && NumStandaloneLights > 0)
+		{
+			uint CandidateLightHiMask = SharedCandidateLightHiMask;
+			uint UniqueLightCount = 0;
+			while (CandidateLightHiMask != 0)
+			{
+				const uint NextHiBitIndex = firstbitlow(CandidateLightHiMask);
+				const uint NextHiBitMask = 1u << NextHiBitIndex;
+				CandidateLightHiMask ^= NextHiBitMask;
+				const uint MaskIndex = NextHiBitIndex;
+				uint CandidateLightMask = SharedStandaloneLightMask[MaskIndex];
+				while (CandidateLightMask != 0)
+				{
+					const uint NextBitIndex = firstbitlow(CandidateLightMask);
+					const uint NextBitMask = 1u << NextBitIndex;
+					CandidateLightMask ^= NextBitMask;
+
+					const uint LocalLightIndex = MaskIndex * 32 + NextBitIndex;
+					const uint2 Offset = uint2(UniqueLightCount % 8u, UniqueLightCount / 8u);
+
+					RWUniqueLightIndices[TransientCoord.TileCoord * CARD_TILE_SIZE + Offset] = LocalLightIndex;
+					InterlockedAdd(RWCardTilePerLightCounters[LocalLightIndex], 1u);
+					++UniqueLightCount;
+				}
+			}
+			RWUniqueLightCount[TransientCoord.TileCoord] = UniqueLightCount;
+		}
+	}
+}
+
+#endif // SHADER_GENERATE_SAMPLE
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_COMPACTION
+
+#include "../PackUnpack.ush"
+
+int2 SampleViewSize;
+Texture2DArray<uint> LightSamples;
+RWStructuredBuffer<uint> RWCompactedTraceTexelData;
+RWStructuredBuffer<uint> RWCompactedTraceTexelAllocator;
+
+groupshared uint SharedGlobalTraceTexelStartOffset;
+
+#if WAVE_OPS
+groupshared uint SharedGroupSum;
+#else
+//@todo - ordered compaction for non-wave ops path
+groupshared uint SharedTraceTexelAllocator;
+groupshared uint SharedTraceTexels[THREADGROUP_SIZE * THREADGROUP_SIZE];
+#endif
+
+#if COMPILER_SUPPORTS_WAVE_SIZE && WAVE_OPS
+WAVESIZE(32)
+#endif
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void CompactLightSampleTracesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint LinearThreadIndex = GroupThreadId.y * THREADGROUP_SIZE + GroupThreadId.x;
+
+	if (LinearThreadIndex == 0)
+#if WAVE_OPS
+	{
+		SharedGroupSum = 0;
+	}
+#else
+	{
+		SharedTraceTexelAllocator = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+#endif
+
+	uint2 SampleCoord = DispatchThreadId.xy;
+	uint SampleLayerIndex = GroupId.z;
+	bool bTraceValid = false;
+	uint TraceTexelForThisThread = 0;
+	
+	if (all(SampleCoord < uint2(SampleViewSize)))
+	{
+		const FLightSample LightSample = UnpackLightSample(LightSamples[uint3(SampleCoord, SampleLayerIndex)]);
+
+		// FLightSample is cleared with 0, so used bVisible to see if this is a valid sample
+		if (LightSample.LocalLightIndex != MAX_LOCAL_LIGHT_INDEX && !LightSample.bCompleted && LightSample.bVisible)
+		{
+			#if WAVE_OPS
+			{
+				bTraceValid = true;
+				TraceTexelForThisThread = PackLumenSampleCoord(SampleCoord, SampleLayerIndex);
+			}
+			#else
+			{
+				uint SharedTexelOffset;
+				InterlockedAdd(SharedTraceTexelAllocator, 1, SharedTexelOffset);
+				SharedTraceTexels[SharedTexelOffset] = PackLumenSampleCoord(SampleCoord, SampleLayerIndex);
+			}
+			#endif
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	#if WAVE_OPS
+	{
+		const uint LastLaneIndex = WaveGetLaneCount() - 1;
+		const uint LaneIndex = WaveGetLaneIndex();
+		const uint OffsetInWave = WavePrefixCountBits(bTraceValid);
+		uint OffsetInGroup = 0;
+
+		if (LaneIndex == LastLaneIndex)
+		{
+			const uint ThisWaveSum = OffsetInWave + (bTraceValid ? 1 : 0);
+			InterlockedAdd(SharedGroupSum, ThisWaveSum, OffsetInGroup);
+		}
+		OffsetInGroup = WaveReadLaneAt(OffsetInGroup, LastLaneIndex) + OffsetInWave;
+
+		GroupMemoryBarrierWithGroupSync();
+
+		// Allocate this group's compacted traces from the global allocator
+		if (LinearThreadIndex == 0)
+		{
+			InterlockedAdd(RWCompactedTraceTexelAllocator[0], SharedGroupSum, SharedGlobalTraceTexelStartOffset);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if (bTraceValid)
+		{
+			RWCompactedTraceTexelData[SharedGlobalTraceTexelStartOffset + OffsetInGroup] = TraceTexelForThisThread;
+		}
+	}
+	#else
+	{
+		if (LinearThreadIndex == 0)
+		{
+			InterlockedAdd(RWCompactedTraceTexelAllocator[0], SharedTraceTexelAllocator, SharedGlobalTraceTexelStartOffset);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if (LinearThreadIndex < SharedTraceTexelAllocator)
+		{
+			RWCompactedTraceTexelData[SharedGlobalTraceTexelStartOffset + LinearThreadIndex] = SharedTraceTexels[LinearThreadIndex];
+		}
+	}
+	#endif
+}
+
+#endif // SHADER_COMPACTION
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_SHADING || SHADER_TEMPORAL_DENOISER
+
+SamplerState BilinearClampedSampler;
+RWTexture2D<float3> RWFinalLightingAtlas;
+RWTexture2D<float3> RWDirectLightingAtlas;
+
+float2 IndirectLightingAtlasHalfTexelSize;
+Texture2D DirectLightingAtlas;
+Texture2D IndirectLightingAtlas;
+Texture2D AlbedoAtlas;
+Texture2D EmissiveAtlas;
+
+float3 GetFinalLighting(float2 AtlasUV, float3 DirectLighting, FLumenCardPageData CardPage)
+{
+	#if RADIOSITY_ATLAS_DOWNSAMPLE_FACTOR == 1
+	float2 IndirectLightingAtlasUV = AtlasUV;
+	#else
+	// When sampling from a downsampled Indirect Lighting atlas we need to appropriately clamp input UVs to prevent bilinear reading outside of the valid area
+	float2 IndirectLightingAtlasUV = clamp(AtlasUV, CardPage.PhysicalAtlasUVRect.xy + IndirectLightingAtlasHalfTexelSize, CardPage.PhysicalAtlasUVRect.zw - IndirectLightingAtlasHalfTexelSize);
+	#endif
+
+	const float3 Albedo = Texture2DSampleLevel(AlbedoAtlas, BilinearClampedSampler, AtlasUV, 0).xyz;
+	const float3 Emissive = Texture2DSampleLevel(EmissiveAtlas, BilinearClampedSampler, AtlasUV, 0).xyz;
+	const float3 IndirectLighting = Texture2DSampleLevel(IndirectLightingAtlas, BilinearClampedSampler, IndirectLightingAtlasUV, 0).xyz;
+
+	return CombineFinalLighting(Albedo, Emissive, DirectLighting, IndirectLighting);
+}
+
+#endif // SHADER_SHADING || SHADER_TEMPORAL_DENOISER
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_SHADING
+
+#define DEBUG_ENABLE 0
+
+// Workaround for a console shader compiler bug generating incorrect code. Likely can be removed in next SDK.
+uint NumSamplesPerPixel1d;
+uint DummyZeroForFixingShaderCompilerBug;
+StructuredBuffer<uint> TileAllocator;
+StructuredBuffer<uint> TileData;
+#if USE_LIGHT_SAMPLES
+Texture2DArray<float4> SampleDiffuseLighting;
+Texture2DArray<uint> LightSamples;
+#endif
+StructuredBuffer<uint> LumenSceneDebugData;
+
+#if THREADGROUP_SIZE != CARD_TILE_SIZE
+#error The code assume THREADGROUP_SIZE == CARD_TILE_SIZE
+#endif
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ShadeLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint TileIndex = GroupId.x;
+	{
+		// 1. Load cards data
+		const uint CardTileIndex = TileIndex;
+		const FCardTileData CardTile = UnpackCardTileData(TileData[CardTileIndex]);
+		const FLumenCardPageData CardPage = GetLumenCardPageData(CardTile.CardPageIndex + DummyZeroForFixingShaderCompilerBug);
+
+		const uint2 TexelCoordInTile = GroupThreadId.xy;
+		uint2 CoordInCardPage = CARD_TILE_SIZE * CardTile.TileCoord + TexelCoordInTile;
+		uint2 AtlasCoord = CardPage.PhysicalAtlasCoord + CoordInCardPage;
+		float2 AtlasUV = CardPage.PhysicalAtlasUVRect.xy + CardPage.PhysicalAtlasUVTexelScale * (CoordInCardPage + 0.5);
+
+		#if DEBUG_ENABLE
+		FShaderPrintContext Ctx = InitDebugContext(LumenSceneDebugData, CardTile, CardPage, AtlasUV, uint2(500, 50));
+		#endif
+
+		float3 DiffuseLighting = 0;
+		#if USE_LIGHT_SAMPLES
+		const FTransientCoord TransientCoord = GetTransientCoord(TileIndex, GroupThreadId.xy);
+		for (uint LightSampleIndex = 0; LightSampleIndex < NumSamplesPerPixel1d; ++LightSampleIndex)
+		{
+			const FLightSample LightSample = UnpackLightSample(LightSamples[uint3(TransientCoord.TexelCoord, LightSampleIndex)]);
+			const float3 LightSampleDiffuseLighting = SampleDiffuseLighting[uint3(TransientCoord.TexelCoord, LightSampleIndex)].xyz;
+			DiffuseLighting += LightSample.Weight * LightSampleDiffuseLighting * (LightSample.bVisible ? 1.f : 0.f);
+
+			#if DEBUG_ENABLE
+			if (Ctx.bIsActive)
+			{
+				Print(Ctx, TEXT("Weight     "), FontWhite); Print(Ctx, LightSample.Weight, FontYellow); Newline(Ctx);
+				Print(Ctx, TEXT("bVisible   "), FontWhite); PrintBool(Ctx, LightSample.bVisible); Newline(Ctx);
+				Print(Ctx, TEXT("bCompleted "), FontWhite); Print(Ctx, LightSample.bCompleted, FontYellow); Newline(Ctx);
+				Print(Ctx, TEXT("LightIndex "), FontWhite); Print(Ctx, LightSample.LocalLightIndex, FontYellow); Newline(Ctx);
+				Print(Ctx, TEXT("Diffuse    "), FontWhite); Print(Ctx, LightSampleDiffuseLighting, FontYellow); Newline(Ctx);						
+			}
+			#endif
+		}
+		#endif // USE_LIGHT_SAMPLES
+
+		// Final composition
+		RWDirectLightingAtlas[AtlasCoord] = DiffuseLighting;
+		RWFinalLightingAtlas[AtlasCoord] = GetFinalLighting(AtlasUV, DiffuseLighting, CardPage);
+	}
+}
+#endif // SHADER_SHADING
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_TEMPORAL_DENOISER
+
+uint DummyZeroForFixingShaderCompilerBug;
+
+Texture2D<float2> SampleLuminanceSumTexture;
+Texture2D ResolvedDirectLightingAtlas;
+Texture2D DiffuseLightingAndSecondMomentHistoryTexture;
+Texture2D<UNORM float> NumFramesAccumulatedHistoryTexture;
+
+float PrevSceneColorPreExposureCorrection;
+float TemporalMaxFramesAccumulated;
+float TemporalNeighborhoodClampScale;
+uint TemporalAdvanceFrame;
+
+RWTexture2D<float4> RWDiffuseLightingAndSecondMoment;
+RWTexture2D<UNORM float> RWNumFramesAccumulated;
+
+StructuredBuffer<uint> TileAllocator;
+StructuredBuffer<uint> TileData;
+
+struct FNeighborhood
+{
+	float3 Mean;
+	float3 ClampMin;
+	float3 ClampMax;
+};
+
+FNeighborhood GetNeighborhood(
+	uint2 BaseTexelCoord,
+	uint2 TexelCoordWithinTile,
+	Texture2D SampleTexture,
+	float3 CenterSample,
+	float2 CardPageMinInPixels, 
+	float2 CardPageMaxInPixels)
+{
+	float3 SampleSum = CenterSample;
+	float3 SampleSqSum = Pow2(CenterSample);
+
+	const int KernelSize = 2;
+	for (int NeigborOffsetY = -KernelSize; NeigborOffsetY <= KernelSize; ++NeigborOffsetY)
+	{
+		for (int NeigborOffsetX = -KernelSize; NeigborOffsetX <= KernelSize; ++NeigborOffsetX)
+		{
+			if (!(NeigborOffsetX == 0 && NeigborOffsetY == 0))
+			{
+				uint2 NeigborScreenCoord = int2(TexelCoordWithinTile) + int2(NeigborOffsetX, NeigborOffsetY) + BaseTexelCoord;
+				NeigborScreenCoord.x = clamp(NeigborScreenCoord.x, CardPageMinInPixels.x, CardPageMaxInPixels.x-1);
+				NeigborScreenCoord.y = clamp(NeigborScreenCoord.y, CardPageMinInPixels.y, CardPageMaxInPixels.y-1);
+
+				float3 NeigborSample = SampleTexture[NeigborScreenCoord].xyz;	
+				SampleSum += NeigborSample;
+				SampleSqSum += Pow2(NeigborSample);
+			}
+		}
+	}
+
+	float NumSamples = Pow2(2.0f * KernelSize + 1.0f);
+	float3 M1 = SampleSum / NumSamples;
+	float3 M2 = SampleSqSum / NumSamples;
+	float3 Variance = max(M2 - Pow2(M1), 0.0f);
+	float3 StdDev = sqrt(Variance);
+	
+	FNeighborhood Neighborhood = (FNeighborhood)0;
+	Neighborhood.Mean = M1;
+	Neighborhood.ClampMin = M1 - TemporalNeighborhoodClampScale * StdDev;
+	Neighborhood.ClampMax = M1 + TemporalNeighborhoodClampScale * StdDev;
+	return Neighborhood;
+}
+
+float3 ClampLuminance(float3 Lighting, float LuminanceClamp)
+{
+	if (Luminance(Lighting) > LuminanceClamp)
+	{
+		Lighting *= LuminanceClamp / Luminance(Lighting);
+	}
+
+	return Lighting;
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DenoiserTemporalCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TileIndex = GroupId.x;
+	const FTransientCoord TransientCoord = GetTransientCoord(TileIndex, GroupThreadId.xy);
+	
+	// 1. Load cards data
+	const uint CardTileIndex = TileIndex;
+	const FCardTileData CardTile = UnpackCardTileData(TileData[CardTileIndex]);
+	const FLumenCardPageData CardPage = GetLumenCardPageData(CardTile.CardPageIndex + DummyZeroForFixingShaderCompilerBug);
+
+	const uint2 TexelCoordInTile = GroupThreadId.xy;
+	const uint2 CoordInCardPage = CARD_TILE_SIZE * CardTile.TileCoord + TexelCoordInTile;
+	const uint2 AtlasCoord = CardPage.PhysicalAtlasCoord + CoordInCardPage;
+	const float2 AtlasUV = CardPage.PhysicalAtlasUVRect.xy + CardPage.PhysicalAtlasUVTexelScale * (CoordInCardPage + 0.5);
+
+	const uint2 AtlasTileBaseCoord = CardPage.PhysicalAtlasCoord + CARD_TILE_SIZE * CardTile.TileCoord;
+	const float2 CardPageMinInPixels = CardPage.PhysicalAtlasCoord;
+	const float2 CardPageMaxInPixels = CardPage.PhysicalAtlasCoord + CardPage.SizeInTexels;
+
+	float2 SampleLuminanceSum = SampleLuminanceSumTexture[TransientCoord.TexelCoord];
+	float3 DiffuseLighting = ResolvedDirectLightingAtlas[AtlasCoord].xyz;
+	float DiffuseSecondMoment = Pow2(Luminance(DiffuseLighting));
+	float NumFramesAccumulated = 0;
+
+	#if VALID_HISTORY
+	// Use history only if we found at least one valid sample
+	{
+		const float4 DiffuseLightingAndSecondMomentHistory = DiffuseLightingAndSecondMomentHistoryTexture[AtlasCoord];
+
+		// Correct history for current frame exposure
+		float3 HistoryDiffuseLighting = DiffuseLightingAndSecondMomentHistory.xyz * PrevSceneColorPreExposureCorrection;
+		float HistoryDiffuseSecondMoment = DiffuseLightingAndSecondMomentHistory.w * Pow2(PrevSceneColorPreExposureCorrection);
+
+		// Reproject and rescale normalized NumFramesAccumulated
+		float NumFramesAccumulatedHistory = NumFramesAccumulatedHistoryTexture[AtlasCoord] * TemporalMaxFramesAccumulated;
+
+		// Advance the frame counter
+		if (TemporalAdvanceFrame != 0)
+		{
+			NumFramesAccumulatedHistory += 1.0f;
+		}
+		NumFramesAccumulated = min(NumFramesAccumulatedHistory, TemporalMaxFramesAccumulated);
+
+		// Clamp history to current neighborhood
+		FNeighborhood DiffuseNeighborhood = GetNeighborhood(AtlasTileBaseCoord, TexelCoordInTile, ResolvedDirectLightingAtlas, DiffuseLighting, CardPageMinInPixels, CardPageMaxInPixels);
+		float3 ClampedHistoryDiffuseLighting = clamp(HistoryDiffuseLighting, DiffuseNeighborhood.ClampMin, DiffuseNeighborhood.ClampMax);
+
+		// Clamp history to max sample luminance
+		ClampedHistoryDiffuseLighting = ClampLuminance(ClampedHistoryDiffuseLighting, SampleLuminanceSum.x);
+		float ClampedHistoryDiffuseSecondMoment = clamp(HistoryDiffuseSecondMoment, 0, Pow2(SampleLuminanceSum.x));
+
+		// Blend history with new samples
+		float Alpha = 1.0f / (1.0f + NumFramesAccumulated);
+		DiffuseLighting = lerp(ClampedHistoryDiffuseLighting, DiffuseLighting, Alpha);
+		DiffuseSecondMoment = lerp(ClampedHistoryDiffuseSecondMoment, DiffuseSecondMoment, Alpha);
+	}
+	#endif
+
+	DiffuseLighting = MakeFinite(DiffuseLighting);
+
+	RWDiffuseLightingAndSecondMoment[AtlasCoord] = float4(DiffuseLighting, DiffuseSecondMoment);
+	RWNumFramesAccumulated[AtlasCoord] = (NumFramesAccumulated + 0.5f) / TemporalMaxFramesAccumulated;
+	RWFinalLightingAtlas[AtlasCoord] = GetFinalLighting(AtlasUV, DiffuseLighting, CardPage);
+	RWDirectLightingAtlas[AtlasCoord] = DiffuseLighting;
+}
+#endif // SHADER_TEMPORAL_DENOISER
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Compute an offset at which all the card tiles affecting a standalone light will be stored
+
+#if SHADER_STANDALONE_COMPACT_OFFSET
+
+uint NumLights;
+uint NumStandaloneLights;
+uint NumSamplesPerPixel1d;	
+StructuredBuffer<uint> CardTilePerLightCounters;
+RWStructuredBuffer<uint> RWCardTilePerLightOffsets;
+RWBuffer<uint> RWCardTilePerLightArgs;
+
+[numthreads(1, 1, 1)]
+void MainCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Make parallel version
+	uint Offset = 0;
+	for (uint LightIt=0; LightIt<NumLights; ++LightIt)
+	{
+		RWCardTilePerLightOffsets[LightIt] = Offset;
+		const uint NumTiles = CardTilePerLightCounters[LightIt];
+		Offset += NumTiles;
+		WriteDispatchIndirectArgs(RWCardTilePerLightArgs, LightIt, NumTiles, 1, NumSamplesPerPixel1d);
+	}
+	WriteDispatchIndirectArgs(RWCardTilePerLightArgs, NumLights, Offset /*Total num. tiles*/, 1, 1);
+}
+#endif // SHADER_STANDALONE_COMPACT_OFFSET
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Build list of all card tile affecting a standalone light (stored at the offset computed above)
+
+#if SHADER_STANDALONE_COMPACT_LIST
+
+Texture2D<uint> UniqueLightCount;
+Texture2D<uint> UniqueLightIndices;
+StructuredBuffer<uint> CardTilePerLightOffsets;
+RWStructuredBuffer<uint> RWCardTilePerLightCounters;
+RWStructuredBuffer<uint> RWCardTilePerLightDatas;
+
+[numthreads(1, 1, 1)]
+void MainCS(
+	uint3 GroupId : SV_GroupID,
+	uint  LinearThreadIndex : SV_GroupIndex,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (LinearThreadIndex == 0)
+	{
+		const uint TileIndex = GroupId.x;  //DispatchThreadId.x;
+		const uint2 TileCoord = GetTile1dToTile2D(TileIndex);
+		const uint LightCount = UniqueLightCount[TileCoord];
+		for (uint LightIt = 0; LightIt < LightCount; ++LightIt)
+		{
+			const uint2 Offset = uint2(LightIt % 8u, LightIt / 8u);
+			const uint LightIndex = UniqueLightIndices[TileCoord * CARD_TILE_SIZE + Offset];
+			if (LightIndex != ~0 && LightIndex != MAX_LOCAL_LIGHT_INDEX)
+			{
+				const uint LightOffset = CardTilePerLightOffsets[LightIndex];
+				uint LocalOffset = 0; 
+				InterlockedAdd(RWCardTilePerLightCounters[LightIndex], 1, LocalOffset);
+				RWCardTilePerLightDatas[LightOffset + LocalOffset] = TileIndex;
+			}
+		}
+	}
+}
+#endif // SHADER_STANDALONE_COMPACT_LIST
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Evaluate lighting for cards tiles affected by a standalone light
+
+#if SHADER_STANDALONE_EVALUATE
+
+uint LightIndex;
+uint ViewIndex;
+StructuredBuffer<uint> CardTilePerLightCounters;
+StructuredBuffer<uint> CardTilePerLightOffsets;
+StructuredBuffer<uint> CardTilePerLightDatas;
+Texture2D<float4> LumenSceneData;
+RWTexture2DArray<uint> RWLightSamples;
+RWTexture2DArray<float4> RWSampleDiffuseLighting;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void MainCS(
+	uint3 GroupId : SV_GroupID,
+	uint  LinearThreadIndex : SV_GroupIndex,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint BaseOffset = CardTilePerLightOffsets[LightIndex];
+	const uint TileCount  = CardTilePerLightCounters[LightIndex];
+	const uint TileIndex = CardTilePerLightDatas[BaseOffset + GroupId.x];
+	const uint2 TileCoord = GetTile1dToTile2D(TileIndex);
+	const uint2 SampleCoord = TileCoord * CARD_TILE_SIZE + GroupThreadId.xy;
+	const uint SampleLayerIndex = GroupId.z;
+	const uint3 TexelCoord = uint3(SampleCoord, SampleLayerIndex);
+	const FDFVector3 PreViewTranslation = GetPreViewTranslation(ViewIndex);
+
+	const FLumenLight LumenLight = LoadLumenLight(LightIndex, DFHackToFloat(PreViewTranslation), ViewExposure[ViewIndex]);
+	FLightSample LightSample = UnpackLightSample(RWLightSamples[TexelCoord]);
+	if (LightSample.LocalLightIndex == LightIndex)
+	{
+		const FLumenSampleSceneData SampleSceneData = UnpackLumenSampleSceneData(LumenSceneData[SampleCoord]);
+		const float ShadowThreshold = 0.01f;
+
+		float ShadowFactor = 1.f;
+		#if USE_LIGHT_FUNCTION_ATLAS
+		if (ShadowFactor > ShadowThreshold && LumenLight.DeferredLightData.LightFunctionAtlasLightIndex > 0)
+		{
+			ShadowFactor *= GetLocalLightFunctionCommon(SampleSceneData.TranslatedWorldPosition, LumenLight.DeferredLightData.LightFunctionAtlasLightIndex);
+		}
+		#elif LIGHT_FUNCTION
+		if (ShadowFactor > ShadowThreshold)
+		{
+			ShadowFactor *= GetLumenLightFunction(SampleSceneData.TranslatedWorldPosition - DFHackToFloat(PreViewTranslation));
+		}
+		#endif
+
+		#if USE_CLOUD_TRANSMITTANCE
+		if (ShadowFactor > ShadowThreshold)
+		{
+			float OutOpticalDepth = 0.0f;
+			ShadowFactor *= lerp(1.0f, GetCloudVolumetricShadow(SampleSceneData.TranslatedWorldPosition, CloudShadowmapTranslatedWorldToLightClipMatrix, CloudShadowmapFarDepthKm, CloudShadowmapTexture, CloudShadowmapSampler, OutOpticalDepth), CloudShadowmapStrength);
+		}
+		#endif
+
+		// * If the sample luminance is below ShadowThreshold, culled the tracing.
+		// * Otherwise attenuate its lighting
+		if (ShadowFactor < ShadowThreshold)
+		{
+			LightSample.bVisible = false;
+			LightSample.bCompleted = true;
+			RWLightSamples[TexelCoord] = PackLightSample(LightSample);
+		}
+		else if (ShadowFactor < 1.f)
+		{
+			LightSample.Weight *= ShadowFactor;
+			RWLightSamples[TexelCoord] = PackLightSample(LightSample);
+		}
+	}
+	
+}
+#endif // SHADER_STANDALONE_EVALUATE

@@ -1,0 +1,32 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define PATH_TRACING 1
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+#include "/Engine/Private/PathTracing/PathTracingShaderUtils.ush"
+
+#if CLOUD_LAYER_PIXEL_SHADER
+#include "./Volume/PathTracingCloudsMaterialCommon.ush"
+#endif
+
+#include "./PathTracingCommon.ush"
+
+
+RAY_TRACING_ENTRY_CALLABLE(PathTracingVolumetricCloudMaterialShader, FPackedPathTracingPayload, PackedPayload)
+{
+#if CLOUD_LAYER_PIXEL_SHADER
+	ResolvedView = ResolveView();
+
+	FDFVector3 AbsoluteWorldPosition = PackedPayload.GetVolumetricCallableShaderInputAbsolutePosition();
+	float H = PackedPayload.GetVolumetricCallableShaderInputCloudHeightKm();
+	float B = PathTracingCloudParameters.CloudLayerBotKm;
+	float T = PathTracingCloudParameters.CloudLayerTopKm;
+
+	FSampleCloudMaterialResult Result = SampleCloudMaterial(AbsoluteWorldPosition, H, B, T);
+	PackedPayload.SetVolumetricCallableShaderOutput(EncodeCloudResult(Result));
+#else
+	// for default shader - just flush outputs
+	PackedPayload.SetVolumetricCallableShaderOutput(0);
+#endif
+}

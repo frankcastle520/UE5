@@ -1,0 +1,73 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "../Common.ush"
+
+#ifdef PER_PAGE_DISPATCH_SETUP
+
+StructuredBuffer<uint> VirtualShadowMapIds;
+uint NumVirtualShadowMapIds;
+uint VirtualShadowMapIdsOffset;
+uint PerPageDispatchDimX;
+uint bUseThreadPerId;
+
+/**
+ * Helper to set up the per-thread indexing to process all relevant pages in the page table.
+ */
+struct FPerPageDispatchSetup
+{
+	bool bValid;
+	uint VirtualShadowMapId;
+	
+	uint LoopStride;
+	uint LoopStart;
+	
+	FVirtualSMLevelOffset BaseLevelOffset;
+	uint PageStartOffset;
+	uint PageEndOffset;
+
+	void Init(uint2 DispatchThreadId)
+	{
+		bValid = false;
+		VirtualShadowMapId = INDEX_NONE;
+		uint LinearThreadId = DispatchThreadId.y * PerPageDispatchDimX + DispatchThreadId.x;
+		if (bUseThreadPerId)
+		{
+			LoopStart = 0;
+			LoopStride = 1;
+			if (LinearThreadId < NumVirtualShadowMapIds)
+			{
+				bValid = true;
+				VirtualShadowMapId = VirtualShadowMapIds[VirtualShadowMapIdsOffset + LinearThreadId];
+			}
+		}
+		else
+		{
+			bValid = true;
+			VirtualShadowMapId = VirtualShadowMapIds[VirtualShadowMapIdsOffset + DispatchThreadId.y];
+			LoopStart = DispatchThreadId.x;
+			LoopStride = PerPageDispatchDimX;
+		}
+
+		BaseLevelOffset = CalcPageTableLevelOffset(VirtualShadowMapId, 0);
+		PageStartOffset = 0;
+		PageEndOffset = 1;
+;
+		if (!BaseLevelOffset.bIsSinglePageSM)
+		{
+			const FVirtualShadowMapProjectionShaderData ProjectionData = GetVirtualShadowMapProjectionData(VirtualShadowMapId);
+			if (ProjectionData.LightType == LIGHT_TYPE_DIRECTIONAL)
+			{
+				PageStartOffset = CalcLevelOffsets(0);
+				PageEndOffset = VSM_PAGE_TABLE_SIZE;// TODO: HMip build still relies on all the entries being cleared. CalcLevelOffsets(1);
+			}
+			else
+			{
+				PageStartOffset = CalcLevelOffsets(ProjectionData.MinMipLevel);
+				PageEndOffset = VSM_PAGE_TABLE_SIZE;
+			}
+		}
+	}
+};
+
+#endif

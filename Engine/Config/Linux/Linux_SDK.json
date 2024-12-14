@@ -1,0 +1,7 @@
+{
+"MainVersion" : "v23_clang-18.1.0-rockylinux8",
+"MinVersion" : "v23_clang-18.1.0-rockylinux8",
+"MaxVersion" : "v23_clang-18.1.0-rockylinux8",
+
+"AutoSDKPlatform" : "Linux_x64",
+}

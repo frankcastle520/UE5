@@ -1,0 +1,38 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+
+Texture2D<float4> HeterogeneousVolumeRadiance;
+Texture2D<float> HeterogeneousVolumeHoldout;
+RWTexture2D<float4> RWColorTexture;
+int DownsampleFactor;
+
+[numthreads(THREADGROUP_SIZE_2D, THREADGROUP_SIZE_2D, 1)]
+void HeterogeneousVolumesCompositeCS(
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint2 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	if (any(DispatchThreadId.xy >= View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+	uint2 ViewPixelCoord = DispatchThreadId.xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = ViewPixelCoord / DownsampleFactor;
+
+	float4 Result;
+	float HeterogeneousVolumeTransmittance = HeterogeneousVolumeRadiance[PixelCoord].a;
+	Result.rgb = HeterogeneousVolumeRadiance[PixelCoord].rgb + RWColorTexture[ViewPixelCoord].rgb * HeterogeneousVolumeTransmittance;
+#if SUPPORT_PRIMITIVE_ALPHA_HOLDOUT
+	if (View.RenderingReflectionCaptureMask == 0.0f)
+	{
+		float SurfaceOpacity = RWColorTexture[ViewPixelCoord].a * HeterogeneousVolumeTransmittance;
+		float VolumeOpacity = HeterogeneousVolumeHoldout[PixelCoord];
+		Result.a = SurfaceOpacity + VolumeOpacity;
+	}
+#else
+	Result.a = RWColorTexture[ViewPixelCoord].a * HeterogeneousVolumeTransmittance;
+#endif
+
+	RWColorTexture[ViewPixelCoord] = Result;
+}

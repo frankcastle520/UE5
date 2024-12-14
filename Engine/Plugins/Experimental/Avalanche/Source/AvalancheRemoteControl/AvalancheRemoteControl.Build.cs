@@ -1,0 +1,33 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class AvalancheRemoteControl : ModuleRules
+{
+    public AvalancheRemoteControl(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        PublicDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Core",
+                "CoreUObject",
+                "Engine",
+                "RemoteControl",
+            }
+        );
+
+        PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "RemoteControlComponents", 
+                "RemoteControlLogic",
+                "Slate",
+                "SlateCore",
+            }
+        );
+
+        ShortName = "AvRC";
+    }
+}

@@ -1,0 +1,53 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define RANDSEQ_ERROR_DIFFUSION 1
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../SkyAtmosphereCommon.ush"
+#include "./Volume/PathTracingAtmosphereCommon.ush"
+#include "./Volume/PathTracingCloudsCommon.ush"
+#include "./Volume/PathTracingCloudsMaterialCommon.ush"
+#include "./Utilities/PathTracingRandomSequence.ush"
+#include "./PathTracingCommon.ush"
+
+RWTexture3D<uint4> CloudMap;
+uint TemporalSeed;
+uint Iteration;
+float BlendFactor;
+
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void PathTracingBuildCloudCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId >= uint3(CloudMapResolution)))
+	{
+		return;
+	}
+
+	RandomSequence RandSequence;
+	uint Seed = DispatchThreadId.x + CloudMapResolution.x * (DispatchThreadId.y + CloudMapResolution.y * DispatchThreadId.z); // unique seed per voxel
+	RandomSequence_Initialize(RandSequence, Seed, TemporalSeed);
+
+	float3 Jitter = RandomSequence_GenerateSample3D(RandSequence);
+	//Jitter = 0.5;
+	float3 UVW = float3(DispatchThreadId + Jitter) / float3(CloudMapResolution);
+	float3 WorldPos = GetCloudClipPosFromUVW(UVW);
+	float H = length(WorldPos);
+	WorldPos = mul(WorldPos, GetCloudClipBasis()) + CloudClipCenterKm; // TangentToWorld
+	FDFVector3 AbsoluteWorldPosition = DFMultiply(WorldPos, SKY_UNIT_TO_CM);
+	FSampleCloudMaterialResult Result = SampleCloudMaterial(AbsoluteWorldPosition, H, CloudLayerBotKm, CloudLayerTopKm);
+
+	if (Iteration > 0)
+	{
+		// if this is an incremental sample, blend with the previous result (so we get some averaging of all values in the voxel)
+		const FSampleCloudMaterialResult Previous = DecodeCloudResult(CloudMap[DispatchThreadId]);
+		Result.Extinction    = lerp(Previous.Extinction   , Result.Extinction   , BlendFactor);
+		Result.Albedo        = lerp(Previous.Albedo       , Result.Albedo       , BlendFactor);
+		Result.EmissiveColor = lerp(Previous.EmissiveColor, Result.EmissiveColor, BlendFactor);
+		Result.PhaseG1       = lerp(Previous.PhaseG1      , Result.PhaseG1      , BlendFactor);
+		Result.PhaseG2       = lerp(Previous.PhaseG2      , Result.PhaseG2      , BlendFactor);
+		Result.PhaseBlend    = lerp(Previous.PhaseBlend   , Result.PhaseBlend   , BlendFactor);
+	}
+	CloudMap[DispatchThreadId] = EncodeCloudResult(Result);
+}

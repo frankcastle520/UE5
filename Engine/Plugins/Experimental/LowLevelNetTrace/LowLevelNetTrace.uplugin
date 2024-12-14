@@ -1,0 +1,24 @@
+{
+	"FileVersion": 1,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Low-level network trace Plugin",
+	"Description": "Actively monitors & reports system network throughput.",
+	"Category": "Profiling",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"EnabledByDefault": true,
+	"IsBetaVersion": true,
+	"SupportedTargetPlatforms": [],
+	"HasExplicitPlatforms": true,
+	"Modules": [
+		{
+			"Name": "LowLevelNetTrace",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [],
+			"HasExplicitPlatforms": true
+		}
+	]
+}

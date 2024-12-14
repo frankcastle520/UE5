@@ -1,0 +1,19 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "MemAllocInSwapNode.h"
+
+namespace UE::Insights::MemoryProfiler
+{
+
+INSIGHTS_IMPLEMENT_RTTI(FMemAllocInSwapNode)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint64 FMemAllocInSwapNode::GetBytesInSwapPage() const
+{
+	return BytesInSwapPage;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace UE::Insights::MemoryProfiler

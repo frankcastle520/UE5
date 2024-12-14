@@ -1,0 +1,410 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LightGridCommon.ush
+=============================================================================*/
+
+#pragma once 
+
+#include "LightData.ush"
+
+#if MOBILE_MULTI_VIEW
+	#define ForwardLightDataISR MobileBasePass.ForwardMMV
+#elif INSTANCED_STEREO
+	#if MATERIALBLENDING_ANY_TRANSLUCENT
+		#define ForwardLightDataISR TranslucentBasePass.Shared.ForwardISR
+	#else
+		#define ForwardLightDataISR OpaqueBasePass.Shared.ForwardISR
+	#endif
+#endif
+
+// If this is changed, the LightGridUses16BitBuffers function from LightGridInjection.cpp should also be updated.
+#define LIGHT_GRID_USES_16BIT_BUFFERS (PLATFORM_SUPPORTS_BUFFER_LOAD_TYPE_CONVERSION && !SHADING_PATH_MOBILE)
+
+// ForwardLightData.CulledLightDataGrid could be 32bit StructuredBuffer or 16bit Buffer, make sure to access it from this function
+uint GetCulledLightDataGrid(uint GridIndex)
+{
+#if LIGHT_GRID_USES_16BIT_BUFFERS
+	return ForwardLightData.CulledLightDataGrid16Bit[GridIndex];
+#else
+	return ForwardLightData.CulledLightDataGrid32Bit[GridIndex];
+#endif
+}
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+uint GetCulledLightDataGridISR(uint GridIndex)
+{
+#if LIGHT_GRID_USES_16BIT_BUFFERS
+	return ForwardLightDataISR.CulledLightDataGrid16Bit[GridIndex];
+#else
+	return ForwardLightDataISR.CulledLightDataGrid32Bit[GridIndex];
+#endif
+}
+#endif
+
+struct FLightGridData
+{
+	uint LightGridPixelSizeShift;
+	float3 LightGridZParams;
+	int3 CulledGridSize;
+};
+
+FLightGridData GetLightGridData(uint EyeIndex)
+{
+	FLightGridData Result;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	BRANCH
+	if (EyeIndex == 0)
+	{
+#endif
+
+		Result.LightGridPixelSizeShift = ForwardLightData.LightGridPixelSizeShift;
+		Result.LightGridZParams = ForwardLightData.LightGridZParams;
+		Result.CulledGridSize = ForwardLightData.CulledGridSize;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	}
+	else
+	{
+		Result.LightGridPixelSizeShift = ForwardLightDataISR.LightGridPixelSizeShift;
+		Result.LightGridZParams = ForwardLightDataISR.LightGridZParams;
+		Result.CulledGridSize = ForwardLightDataISR.CulledGridSize;
+	}
+#endif
+
+	return Result;
+}
+
+uint3 ComputeLightGridCellCoordinate(uint2 PixelPos, float SceneDepth, uint EyeIndex)
+{
+	const FLightGridData GridData = GetLightGridData(EyeIndex);
+	uint ZSlice = (uint)(max(0, log2(SceneDepth * GridData.LightGridZParams.x + GridData.LightGridZParams.y) * GridData.LightGridZParams.z));
+	ZSlice = min(ZSlice, (uint)(GridData.CulledGridSize.z - 1));
+	return uint3(PixelPos >> GridData.LightGridPixelSizeShift, ZSlice);
+}
+
+uint ComputeLightGridCellIndex(uint3 GridCoordinate, uint EyeIndex)
+{
+	const FLightGridData GridData = GetLightGridData(EyeIndex);
+	return (GridCoordinate.z * GridData.CulledGridSize.y + GridCoordinate.y) * GridData.CulledGridSize.x + GridCoordinate.x;
+}
+
+uint ComputeLightGridCellIndex(uint2 PixelPos, float SceneDepth, uint EyeIndex)
+{
+	return ComputeLightGridCellIndex(ComputeLightGridCellCoordinate(PixelPos, SceneDepth, EyeIndex), EyeIndex);
+}
+
+uint ComputeLightGridCellIndex(uint2 PixelPos, float SceneDepth)
+{
+	return ComputeLightGridCellIndex(PixelPos, SceneDepth, 0);
+}
+
+#ifndef NUM_CULLED_LIGHTS_GRID_STRIDE
+#define NUM_CULLED_LIGHTS_GRID_STRIDE 0
+#endif
+
+#ifndef LOCAL_LIGHT_DATA_STRIDE
+#define LOCAL_LIGHT_DATA_STRIDE 0
+#endif
+
+uint GetNumLocalLights(uint EyeIndex)
+{
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	return (EyeIndex == 0) ? ForwardLightData.NumLocalLights : ForwardLightDataISR.NumLocalLights;
+#else
+	return ForwardLightData.NumLocalLights;
+#endif
+}
+
+uint GetMaxLightsPerCell(uint EyeIndex)
+{
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	return (EyeIndex == 0) ? ForwardLightData.MaxCulledLightsPerCell  : ForwardLightDataISR.MaxCulledLightsPerCell ;
+#else
+	return ForwardLightData.MaxCulledLightsPerCell ;
+#endif
+}
+
+uint PackCulledLightsGridHeader0(uint NumVisibleLights, uint NumVisibleMegaLights)
+{
+	return (NumVisibleMegaLights << 16) | (NumVisibleLights & 0xFFFF);
+}
+
+uint PackCulledLightsGridHeader1(uint CulledLightDataStart, bool bHasRectLight, bool bHasTexturedLight)
+{
+	return (bHasTexturedLight ? 0x80000000 : 0) | (bHasRectLight ? 0x40000000 : 0) | (CulledLightDataStart & 0x3FFFFFFF);
+}
+
+void UnpackCulledLightsGridHeader0(uint PackedData0, out uint NumVisibleLights, out uint NumVisibleMegaLights)
+{
+	NumVisibleLights = PackedData0 & 0xFFFF;
+	NumVisibleMegaLights = (PackedData0 >> 16) & 0xFFFF;
+}
+
+void UnpackCulledLightsGridHeader1(uint PackedData1, out uint CulledLightDataStart, out bool bHasRectLight, out bool bHasTexturedLight)
+{
+	CulledLightDataStart = (PackedData1 & 0x3FFFFFFF);
+	bHasRectLight = (PackedData1 & 0x40000000) != 0;
+	bHasTexturedLight = (PackedData1 & 0x80000000) != 0;
+}
+
+struct FCulledLightsGridHeader
+{
+	uint NumLights;
+	uint NumMegaLights;
+	uint DataStartIndex;
+	uint MegaLightsDataStartIndex;
+	bool bHasRectLight;
+	bool bHasTexturedLight;
+};
+
+FCulledLightsGridHeader GetCulledLightsGridHeader(uint GridIndex, uint EyeIndex)
+{
+	FCulledLightsGridHeader Result;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	BRANCH
+	if (EyeIndex == 0)
+	{
+#endif
+
+		const uint PackedData0 = ForwardLightData.NumCulledLightsGrid[GridIndex * NUM_CULLED_LIGHTS_GRID_STRIDE + 0];
+		UnpackCulledLightsGridHeader0(PackedData0, Result.NumLights, Result.NumMegaLights);
+		Result.NumLights = min(Result.NumLights, ForwardLightData.NumLocalLights);
+		Result.NumMegaLights = min(Result.NumMegaLights, ForwardLightData.NumLocalLights);
+
+		const uint PackedData1 = ForwardLightData.NumCulledLightsGrid[GridIndex * NUM_CULLED_LIGHTS_GRID_STRIDE + 1];
+		UnpackCulledLightsGridHeader1(PackedData1, Result.DataStartIndex, Result.bHasRectLight, Result.bHasTexturedLight);
+		
+		Result.MegaLightsDataStartIndex = Result.DataStartIndex + Result.NumLights - Result.NumMegaLights;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	}
+	else
+	{
+		const uint PackedData0 = ForwardLightDataISR.NumCulledLightsGrid[GridIndex * NUM_CULLED_LIGHTS_GRID_STRIDE + 0];
+		UnpackCulledLightsGridHeader0(PackedData0, Result.NumLights, Result.NumMegaLights);
+		Result.NumLights = min(Result.NumLights, ForwardLightDataISR.NumLocalLights);
+		Result.NumMegaLights = min(Result.NumMegaLights, ForwardLightDataISR.NumLocalLights);
+
+		const uint PackedData1 = ForwardLightDataISR.NumCulledLightsGrid[GridIndex * NUM_CULLED_LIGHTS_GRID_STRIDE + 1];
+		UnpackCulledLightsGridHeader1(PackedData1, Result.DataStartIndex, Result.bHasRectLight, Result.bHasTexturedLight);
+		
+		Result.MegaLightsDataStartIndex = Result.DataStartIndex + Result.NumLights - Result.NumMegaLights;
+	}
+#endif
+
+	return Result;
+}
+
+struct FCulledReflectionCapturesGridHeader
+{
+	uint NumReflectionCaptures;
+	uint DataStartIndex;
+};
+
+FCulledReflectionCapturesGridHeader GetCulledReflectionCapturesGridHeader(uint GridIndex, uint EyeIndex)
+{
+	FCulledReflectionCapturesGridHeader Result;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	BRANCH
+	if (EyeIndex == 0)
+	{
+#endif
+
+		const uint NumCulledEntryIndex = (ForwardLightData.NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE;
+		Result.NumReflectionCaptures = min(ForwardLightData.NumCulledLightsGrid[NumCulledEntryIndex + 0], ForwardLightData.NumReflectionCaptures);
+		Result.DataStartIndex = ForwardLightData.NumCulledLightsGrid[NumCulledEntryIndex + 1];
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	}
+	else
+	{
+		const uint NumCulledEntryIndex = (ForwardLightDataISR.NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE;
+		Result.NumReflectionCaptures = min(ForwardLightDataISR.NumCulledLightsGrid[NumCulledEntryIndex + 0], ForwardLightDataISR.NumReflectionCaptures);
+		Result.DataStartIndex = ForwardLightDataISR.NumCulledLightsGrid[NumCulledEntryIndex + 1];
+	}
+#endif
+
+	return Result;
+}
+
+FDirectionalLightData GetDirectionalLightData(uint EyeIndex)
+{
+	FDirectionalLightData Result;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	BRANCH
+	if (EyeIndex == 0)
+	{
+#endif
+	
+		Result.HasDirectionalLight					= ForwardLightData.HasDirectionalLight;
+		Result.DirectionalLightShadowMapChannelMask = ForwardLightData.DirectionalLightShadowMapChannelMask;
+		Result.DirectionalLightDistanceFadeMAD		= ForwardLightData.DirectionalLightDistanceFadeMAD;
+		Result.DirectionalLightColor				= ForwardLightData.DirectionalLightColor;
+		Result.DirectionalLightDirection			= ForwardLightData.DirectionalLightDirection;
+		Result.DirectionalLightSourceRadius			= ForwardLightData.DirectionalLightSourceRadius;
+		Result.DirectionalLightSoftSourceRadius		= ForwardLightData.DirectionalLightSoftSourceRadius;
+		Result.DirectionalLightSpecularScale		= ForwardLightData.DirectionalLightSpecularScale;
+		Result.DirectionalLightDiffuseScale			= ForwardLightData.DirectionalLightDiffuseScale;
+		Result.LightFunctionAtlasLightIndex			= ForwardLightData.LightFunctionAtlasLightIndex;
+		Result.bAffectsTranslucentLighting			= ForwardLightData.bAffectsTranslucentLighting;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	}
+	else
+	{
+		Result.HasDirectionalLight					= ForwardLightDataISR.HasDirectionalLight;
+		Result.DirectionalLightShadowMapChannelMask = ForwardLightDataISR.DirectionalLightShadowMapChannelMask;
+		Result.DirectionalLightDistanceFadeMAD		= ForwardLightDataISR.DirectionalLightDistanceFadeMAD;
+		Result.DirectionalLightColor				= ForwardLightDataISR.DirectionalLightColor;
+		Result.DirectionalLightDirection			= ForwardLightDataISR.DirectionalLightDirection;
+		Result.DirectionalLightSourceRadius			= ForwardLightDataISR.DirectionalLightSourceRadius;
+		Result.DirectionalLightSoftSourceRadius		= ForwardLightDataISR.DirectionalLightSoftSourceRadius;
+		Result.DirectionalLightSpecularScale		= ForwardLightDataISR.DirectionalLightSpecularScale;
+		Result.DirectionalLightDiffuseScale			= ForwardLightDataISR.DirectionalLightDiffuseScale;
+		Result.LightFunctionAtlasLightIndex			= ForwardLightDataISR.LightFunctionAtlasLightIndex;
+		Result.bAffectsTranslucentLighting			= ForwardLightDataISR.bAffectsTranslucentLighting;
+	}
+#endif
+
+	return Result;
+}
+
+FLocalLightData GetLocalLightData_Internal(
+	uint LocalLightIndex,
+	uint ClusteredDeferredSupportedEndIndex,
+	uint MegaLightsSupportedStartIndex,
+	uint SimpleLightsEndIndex,
+	float4 InData0, float4 InData1, float4 InData2, float4 InData3, float4 InData4, float4 InData5)
+{
+	FLocalLightData Out = (FLocalLightData)0;
+
+	Out.bClusteredDeferredSupported				= LocalLightIndex <  ClusteredDeferredSupportedEndIndex;
+	Out.bMegaLightsSupported					= LocalLightIndex >= MegaLightsSupportedStartIndex;
+	Out.bIsSimpleLight							= LocalLightIndex <  SimpleLightsEndIndex;
+	Out.LightPositionAndInvRadius				= InData0;
+	Out.LightColorAndIdAndFalloffExponent		= InData1;
+	Out.LightDirectionAndShadowMask				= InData2;
+	Out.SpotAnglesAndSourceRadiusPacked			= InData3;
+	Out.LightTangentAndIESDataAndSpecularScale	= InData4;
+	Out.RectData								= InData5.xyz;
+	// See PackVirtualShadowMapIdAndPrevLocalLightIndex
+	Out.VirtualShadowMapId						= int(asuint(InData5.w) >> 16U) - 1;
+	Out.PrevLocalLightIndex						= int(asuint(InData5.w) & 0xFFFF) - 1;
+	Out.LightSceneId							= int(Out.LightColorAndIdAndFalloffExponent.z);
+
+	return Out;
+}
+
+FLocalLightData GetLocalLightDataNonStereo(uint LocalLightIndex)
+{
+	FLocalLightData Out;
+	uint LocalLightBaseIndex = LocalLightIndex * LOCAL_LIGHT_DATA_STRIDE;
+
+	Out = GetLocalLightData_Internal(
+		LocalLightIndex,
+		ForwardLightData.ClusteredDeferredSupportedEndIndex,
+		ForwardLightData.MegaLightsSupportedStartIndex,
+		ForwardLightData.SimpleLightsEndIndex,
+		ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 0],
+		ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 1],
+		ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 2],
+		ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 3],
+		ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 4],
+		ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 5]);
+	return Out;
+}
+
+FLocalLightData GetLocalLightData(uint GridIndex, uint EyeIndex)
+{
+	FLocalLightData Out;
+
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	BRANCH
+	if (EyeIndex == 0)
+	{
+#endif
+		uint LocalLightIndex = GetCulledLightDataGrid(GridIndex);
+		uint LocalLightBaseIndex = LocalLightIndex * LOCAL_LIGHT_DATA_STRIDE;
+
+		Out = GetLocalLightData_Internal(
+			LocalLightIndex, 
+			ForwardLightData.ClusteredDeferredSupportedEndIndex,
+			ForwardLightData.MegaLightsSupportedStartIndex,
+			ForwardLightData.SimpleLightsEndIndex,
+			ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 0],
+			ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 1],
+			ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 2],
+			ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 3],
+			ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 4],
+			ForwardLightData.ForwardLocalLightBuffer[LocalLightBaseIndex + 5]);
+#if (INSTANCED_STEREO || MOBILE_MULTI_VIEW)
+	}
+	else
+	{
+		uint LocalLightIndex = GetCulledLightDataGridISR(GridIndex);
+		uint LocalLightBaseIndex = LocalLightIndex * LOCAL_LIGHT_DATA_STRIDE;
+
+		Out = GetLocalLightData_Internal(
+			LocalLightIndex,
+			ForwardLightDataISR.ClusteredDeferredSupportedEndIndex,
+			ForwardLightDataISR.MegaLightsSupportedStartIndex,
+			ForwardLightDataISR.SimpleLightsEndIndex,
+			ForwardLightDataISR.ForwardLocalLightBuffer[LocalLightBaseIndex + 0],
+			ForwardLightDataISR.ForwardLocalLightBuffer[LocalLightBaseIndex + 1],
+			ForwardLightDataISR.ForwardLocalLightBuffer[LocalLightBaseIndex + 2],
+			ForwardLightDataISR.ForwardLocalLightBuffer[LocalLightBaseIndex + 3],
+			ForwardLightDataISR.ForwardLocalLightBuffer[LocalLightBaseIndex + 4],
+			ForwardLightDataISR.ForwardLocalLightBuffer[LocalLightBaseIndex + 5]);
+	}
+#endif
+	return Out;
+}
+
+/**
+ * Helpers to pack/unpack the shadow mask for cluster shading and virtual shadow map
+ * Currently hard-coded for 4 bits per light, up to 32 lights per pixel in a uint4
+ */
+uint4 InitializePackedShadowMask()
+{
+	return uint(0U).xxxx;
+}
+
+uint GetPackedShadowMaskMaxLightCount()
+{
+	return VirtualShadowMap.PackedShadowMaskMaxLightCount;
+}
+
+void PackShadowMask(inout uint4 InOutShadowMask, float InShadowFactor, uint InLightIndex)
+{
+	uint Value = uint(round((InShadowFactor) * 15.0f)) & 15U;
+	uint Dword = InLightIndex / 8;
+
+	InOutShadowMask.x ^= (Dword == 0U) ? (Value << ((InLightIndex      ) * 4U)) : 0U;
+	InOutShadowMask.y ^= (Dword == 1U) ? (Value << ((InLightIndex -  8U) * 4U)) : 0U;
+	InOutShadowMask.z ^= (Dword == 2U) ? (Value << ((InLightIndex - 16U) * 4U)) : 0U;
+	InOutShadowMask.w ^= (Dword == 3U) ? (Value << ((InLightIndex - 24U) * 4U)) : 0U;
+}
+
+float UnpackShadowMask(uint4 InShadowMask, uint InLightIndex)
+{
+	uint Dword = InLightIndex / 8;
+	uint MaskBits = (InShadowMask[Dword] >> (InLightIndex - Dword*8U) * 4U) & 15U;
+	return (float(MaskBits) / 15.0f);
+}
+
+// Unpack with dither to hide some of the quantization
+float UnpackShadowMask(uint4 InShadowMask, uint InLightIndex, float Dither)
+{	
+	float ShadowFactor = UnpackShadowMask(InShadowMask, InLightIndex);
+	if (ShadowFactor > 0.0f && ShadowFactor < 1.0f)
+	{
+		ShadowFactor = saturate(ShadowFactor + (Dither - 0.5f) * (1.0f / 16.0f));
+	}
+	return ShadowFactor;
+}
+

@@ -1,0 +1,4 @@
+gradlew buildCMakeDebug
+gradlew buildCMakeRelWithDebInfo
+
+build artifacts are in 'out_swappy'

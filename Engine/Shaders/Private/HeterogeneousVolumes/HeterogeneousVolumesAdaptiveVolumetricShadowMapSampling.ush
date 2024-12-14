@@ -1,0 +1,503 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "HeterogeneousVolumesAdaptiveVolumetricShadowMapUtils.ush"
+
+#define AVSM_SAMPLE_MODE_DISABLED 0
+#define AVSM_SAMPLE_MODE_TWO_LEVEL_VECTORIZED 1
+#define AVSM_SAMPLE_MODE_TWO_LEVEL_VECTORIZED_LOOP 2
+//#define AVSM_SAMPLE_MODE_TWO_LEVEL_REFERENCE 3
+//#define AVSM_SAMPLE_MODE_BINARY_SEARCH 4
+//#define AVSM_SAMPLE_MODE_REFERENCE 5
+
+#ifndef AVSM_SAMPLE_MODE
+#define AVSM_SAMPLE_MODE AVSM_SAMPLE_MODE_TWO_LEVEL_VECTORIZED_LOOP
+#endif // AVSM_SAMPLE_MODE
+
+struct FAdaptiveVolumetricShadowMap
+{
+	float4x4 TranslatedWorldToShadow[6];
+	float3 TranslatedWorldOrigin;
+	float4 TranslatedWorldPlane;
+
+	int2 Resolution;
+	int NumShadowMatrices;
+	int MaxSampleCount;
+	bool bIsEmpty;
+	bool bIsDirectionalLight;
+
+	StructuredBuffer<uint4> IndirectionBuffer;
+	StructuredBuffer<uint> SampleBuffer;
+};
+
+bool AVSM_PixelAndDepth(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	int Face,
+	float3 TranslatedWorldPosition,
+	inout float2 Pixel,
+	inout float Depth
+)
+{
+	Depth = 0.0;
+	Pixel = -1;
+	float4 ShadowPositionAsFloat4 = mul(float4(TranslatedWorldPosition, 1), ShadowMap.TranslatedWorldToShadow[Face]);
+	if (ShadowPositionAsFloat4.w > 0)
+	{
+		float3 ShadowPosition = ShadowPositionAsFloat4.xyz / ShadowPositionAsFloat4.w;
+		if (all(ShadowPosition.xyz > 0) || all(ShadowPosition.xy < 1))
+		{
+			Pixel = clamp(ShadowPosition.xy * ShadowMap.Resolution - 0.5, 0, ShadowMap.Resolution - 1);
+			if (ShadowMap.bIsDirectionalLight)
+			{
+				Depth = dot(ShadowMap.TranslatedWorldPlane.xyz, TranslatedWorldPosition) + ShadowMap.TranslatedWorldPlane.w;
+			}
+			return true;
+		}
+	}
+
+	return false;
+}
+
+uint AVSM_LinearIndex(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	uint Face,
+	uint2 PixelCoord
+)
+{
+	uint LinearIndex = Face * ShadowMap.Resolution.x * ShadowMap.Resolution.y + PixelCoord.y * ShadowMap.Resolution.x + PixelCoord.x;
+	return LinearIndex;
+}
+
+float SafeRcp(float Value)
+{
+	return Value > 0 ? rcp(Value) : 0.0;
+}
+
+float AVSM_Sample_Reference(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	int Face,
+	int2 Pixel,
+	float WorldHitT
+)
+{
+	uint LinearIndex = AVSM_LinearIndex(ShadowMap, Face, Pixel);
+	FAVSMIndirectionData IndirectionData = AVSM_UnpackIndirectionData(ShadowMap.IndirectionBuffer[LinearIndex]);
+	if (WorldHitT < IndirectionData.BeginX)
+	{
+		return 1.0;
+	}
+
+	FAVSMSampleData ShadowData[2] = {
+		AVSM_CreateSampleData(0.0, 1.0),
+		AVSM_CreateSampleData(0.0, 1.0)
+	};
+
+	int TopLevelSampleCount = CalcTopLevelSampleCount(IndirectionData.SampleCount);
+	if (TopLevelSampleCount > 0)
+	{
+		// Early-out
+		if (WorldHitT >= IndirectionData.EndX)
+		{
+			int LastSampleIndex = IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndirectionData.SampleCount - 1;
+			return AVSM_UnpackSampleData(ShadowMap.SampleBuffer[LastSampleIndex], IndirectionData).Tau;
+		}
+
+		// Initialize from the top-level
+		ShadowData[0] = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset], IndirectionData);
+
+		// Iterate through the linear span of offset transmittance information
+		for (int ElementIndex = 0; ElementIndex < IndirectionData.SampleCount - 1; ++ElementIndex)
+		{
+			ShadowData[1] = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + ElementIndex], IndirectionData);
+			if (WorldHitT < ShadowData[1].X)
+			{
+				break;
+			}
+
+			ShadowData[0] = ShadowData[1];
+		}
+	}
+
+	float BlendWeight = saturate((WorldHitT - ShadowData[0].X) * SafeRcp(ShadowData[1].X - ShadowData[0].X));
+	float Transmittance = lerp(ShadowData[0].Tau, ShadowData[1].Tau, BlendWeight);
+	return Transmittance;
+}
+
+float AVSM_Sample_BinarySearch(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	int Face,
+	int2 Pixel,
+	float WorldHitT
+)
+{
+	uint LinearIndex = AVSM_LinearIndex(ShadowMap, Face, Pixel);
+	FAVSMIndirectionData IndirectionData = AVSM_UnpackIndirectionData(ShadowMap.IndirectionBuffer[LinearIndex]);
+	if (WorldHitT < IndirectionData.BeginX)
+	{
+		return 1.0;
+	}
+
+	FAVSMSampleData ShadowData[2] = {
+		AVSM_CreateSampleData(0.0, 1.0),
+		AVSM_CreateSampleData(0.0, 1.0)
+	};
+
+	int TopLevelSampleCount = CalcTopLevelSampleCount(IndirectionData.SampleCount);
+	if (TopLevelSampleCount > 0)
+	{
+		// Early-out
+		if (WorldHitT >= IndirectionData.EndX)
+		{
+			int LastSampleIndex = IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndirectionData.SampleCount - 1;
+			return AVSM_UnpackSampleData(ShadowMap.SampleBuffer[LastSampleIndex], IndirectionData).Tau;
+		}
+
+		// Initialize from the top-level
+		ShadowData[0] = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset], IndirectionData);
+
+		// Account for the shifted bottom-level
+		int ElementIndexMin = -1;
+		int ElementIndexMax = IndirectionData.SampleCount - 1;
+		while (ElementIndexMax - ElementIndexMin > 1)
+		{
+			int ElementIndex = (ElementIndexMin + ElementIndexMax + 1) / 2;
+			FAVSMSampleData SampleData = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + ElementIndex], IndirectionData);
+
+			if (WorldHitT < SampleData.X)
+			{
+				ElementIndexMax = ElementIndex;
+				ShadowData[1] = SampleData;
+			}
+			else
+			{
+				ElementIndexMin = ElementIndex;
+				ShadowData[0] = SampleData;
+			}
+		}
+	}
+
+	float BlendWeight = saturate((WorldHitT - ShadowData[0].X) * SafeRcp(ShadowData[1].X - ShadowData[0].X));
+	float Transmittance = lerp(ShadowData[0].Tau, ShadowData[1].Tau, BlendWeight);
+	return Transmittance;
+}
+#if 0
+float AVSM_Sample_TwoLevel_Reference(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	int Face,
+	int2 Pixel,
+	float WorldHitT
+)
+{
+	uint LinearIndex = AVSM_LinearIndex(ShadowMap, Face, Pixel);
+	FAVSMIndirectionData IndirectionData = AVSM_UnpackIndirectionData(ShadowMap.IndirectionBuffer[LinearIndex]);
+	if (WorldHitT < IndirectionData.BeginX)
+	{
+		return 1.0;
+	}
+
+	FAVSMSampleData ShadowData[2] = {
+		AVSM_CreateSampleData(0.0, 1.0),
+		AVSM_CreateSampleData(0.0, 1.0)
+	};
+
+	int TopLevelSampleIndex = 0;
+
+	// Level 1
+	int TopLevelSampleCount = CalcTopLevelSampleCount(IndirectionData.SampleCount);
+	if (TopLevelSampleCount > 0)
+	{
+		if (WorldHitT >= IndirectionData.EndX)
+		{
+			int LastSampleIndex = IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndirectionData.SampleCount - 1;
+			return AVSM_UnpackSampleData(AVSM.SampleBuffer[LastSampleIndex], IndirectionData).Tau;
+		}
+
+		ShadowData[0] = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset], IndirectionData);
+
+		// Iterate through the top-level
+		for (TopLevelSampleIndex = 0; TopLevelSampleIndex < TopLevelSampleCount; ++TopLevelSampleIndex)
+		{
+			ShadowData[1] = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset + TopLevelSampleIndex], IndirectionData);
+			if (WorldHitT < ShadowData[1].X)
+			{
+				break;
+			}
+
+			ShadowData[0] = ShadowData[1];
+		}
+	}
+
+	// Level 2
+	int SampleIndexMin = max((TopLevelSampleIndex - 1) * 4, 0);
+	// Account for the index shifting in the bottom-level span
+	int SampleIndexMax = min(TopLevelSampleIndex * 4, IndirectionData.SampleCount - 1);
+	for (int SampleIndex = SampleIndexMin; SampleIndex < SampleIndexMax; ++SampleIndex)
+	{
+		ShadowData[1] = AVSM_UnpackSampleData(ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + SampleIndex], IndirectionData);
+		if (WorldHitT < ShadowData[1].X)
+		{
+			break;
+		}
+
+		ShadowData[0] = ShadowData[1];
+	}
+
+	// Lerp the final value
+	float BlendWeight = saturate((WorldHitT - ShadowData[0].X) * SafeRcp(ShadowData[1].X - ShadowData[0].X));
+	float Transmittance = lerp(ShadowData[0].Tau, ShadowData[1].Tau, BlendWeight);
+	return Transmittance;
+}
+#endif
+
+float AVSM_Sample_TwoLevel_Vectorized(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	int Face,
+	int2 Pixel,
+	float WorldHitT
+)
+{
+	uint LinearIndex = AVSM_LinearIndex(ShadowMap, Face, Pixel);
+	FAVSMIndirectionData IndirectionData = AVSM_UnpackIndirectionData(ShadowMap.IndirectionBuffer[LinearIndex]);
+	if (WorldHitT < IndirectionData.BeginX)
+	{
+		return 1.0;
+	}
+
+	FAVSMSampleData ShadowData[2] = {
+		AVSM_CreateSampleData(0.0, 1.0),
+		AVSM_CreateSampleData(0.0, 1.0)
+	};
+
+	int TopLevelSampleIndex = 0;
+
+	// Level 1
+	int TopLevelSampleCount = CalcTopLevelSampleCount(IndirectionData.SampleCount);
+	if (TopLevelSampleCount > 0)
+	{
+		if (WorldHitT >= IndirectionData.EndX)
+		{
+			int LastIndex = IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndirectionData.SampleCount - 1;
+			return AVSM_UnpackSampleData(ShadowMap.SampleBuffer[LastIndex], IndirectionData).Tau;
+		}
+
+		int TopLevelSampleOffset = 0;
+#if AVSM_SAMPLE_MODE == AVSM_SAMPLE_MODE_TWO_LEVEL_VECTORIZED_LOOP
+		for (; TopLevelSampleOffset < TopLevelSampleCount; TopLevelSampleOffset += 4)
+#endif
+		{
+			int4 IndexOffset = TopLevelSampleOffset + int4(0, 1, 2, 3);
+
+			int4 PackedShadowData4 = int4(
+				ShadowMap.SampleBuffer[IndirectionData.PixelOffset + IndexOffset[0]],
+				ShadowMap.SampleBuffer[IndirectionData.PixelOffset + IndexOffset[1]],
+				ShadowMap.SampleBuffer[IndirectionData.PixelOffset + IndexOffset[2]],
+				ShadowMap.SampleBuffer[IndirectionData.PixelOffset + IndexOffset[3]]
+			);
+
+			float4 Depths = float4(
+				AVSM_UnpackSampleData(PackedShadowData4[0], IndirectionData).X,
+				AVSM_UnpackSampleData(PackedShadowData4[1], IndirectionData).X,
+				AVSM_UnpackSampleData(PackedShadowData4[2], IndirectionData).X,
+				AVSM_UnpackSampleData(PackedShadowData4[3], IndirectionData).X
+			);
+
+			int4 Result = float4(WorldHitT, WorldHitT, WorldHitT, WorldHitT) > Depths;
+			int LocalSampleIndex = Result[0] + Result[1] + Result[2] + Result[3];
+
+			ShadowData[0] = AVSM_UnpackSampleData(PackedShadowData4[max(LocalSampleIndex - 1, 0)], IndirectionData);
+			ShadowData[1] = AVSM_UnpackSampleData(PackedShadowData4[min(LocalSampleIndex, 3)], IndirectionData);
+			TopLevelSampleIndex = min(TopLevelSampleOffset + LocalSampleIndex, TopLevelSampleCount);
+#if AVSM_SAMPLE_MODE == AVSM_SAMPLE_MODE_TWO_LEVEL_VECTORIZED_LOOP
+			if (LocalSampleIndex < 4)
+			{
+				break;
+			}
+#endif
+		}
+	}
+
+	// Level 2
+	if (TopLevelSampleCount > 0)
+	{
+		int4 IndexOffset = max((TopLevelSampleIndex - 1) * 4, 0);
+		IndexOffset += int4(0, 1, 2, 3);
+
+		int4 PackedShadowData4 = int4(
+			ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndexOffset.x],
+			ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndexOffset.y],
+			ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndexOffset.z],
+			ShadowMap.SampleBuffer[IndirectionData.PixelOffset + Align4(TopLevelSampleCount) + IndexOffset.w]
+		);
+
+		float4 Depths = float4(
+			AVSM_UnpackSampleData(PackedShadowData4.x, IndirectionData).X,
+			AVSM_UnpackSampleData(PackedShadowData4.y, IndirectionData).X,
+			AVSM_UnpackSampleData(PackedShadowData4.z, IndirectionData).X,
+			AVSM_UnpackSampleData(PackedShadowData4.w, IndirectionData).X
+		);
+
+		int4 Result = float4(WorldHitT, WorldHitT, WorldHitT, WorldHitT) > Depths;
+		int Index = Result.x + Result.y + Result.z + Result.w;
+
+		if (Index > 0)
+		{
+			ShadowData[0] = AVSM_UnpackSampleData(PackedShadowData4[max(Index - 1, 0)], IndirectionData);
+		}
+		ShadowData[1] = AVSM_UnpackSampleData(PackedShadowData4[min(Index, 3)], IndirectionData);
+	}
+
+	// Lerp the final value
+	float BlendWeight = saturate((WorldHitT - ShadowData[0].X) * SafeRcp(ShadowData[1].X - ShadowData[0].X));
+	float Transmittance = lerp(ShadowData[0].Tau, ShadowData[1].Tau, BlendWeight);
+	return Transmittance;
+}
+
+float AVSM_Sample(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	int Face,
+	int2 Pixel,
+	float WorldHitT
+)
+{
+	return
+// Temporarily disabling vectorized loop for reference
+#if AVSM_SAMPLE_MODE == AVSM_SAMPLE_MODE_TWO_LEVEL_VECTORIZED_LOOP
+		AVSM_Sample_BinarySearch(
+#else
+		AVSM_Sample_TwoLevel_Vectorized(
+#endif
+			ShadowMap,
+			Face,
+			Pixel,
+			WorldHitT
+		);
+}
+
+float AVSM_SampleTransmittance(
+	inout FAdaptiveVolumetricShadowMap ShadowMap,
+	float3 TranslatedWorldPosition,
+	float3 LightTranslatedWorldPosition
+)
+{
+	if (any(ShadowMap.Resolution == 0))
+	{
+		return 1.0;
+	}
+
+	float Transmittance = 1.0;
+
+	int Face = 0;
+	if (AVSM.NumShadowMatrices > 1)
+	{
+		float3 LightDir = TranslatedWorldPosition - ShadowMap.TranslatedWorldOrigin;
+		float3 LightDirAbs = abs(LightDir);
+
+		Face = LightDirAbs[1] > LightDirAbs[0] ? 1 : 0;
+		Face = LightDirAbs[2] > LightDirAbs[Face] ? 2 : Face;
+
+		int FaceOffset = (sign(LightDir[Face]) > 0) ? 1 : 0;
+		Face = Face * 2 + FaceOffset;
+	}
+
+	float4 ShadowPositionAsFloat4 = 0;
+	float3 ShadowPosition = 0;
+	{
+		ShadowPositionAsFloat4 = mul(float4(TranslatedWorldPosition, 1), ShadowMap.TranslatedWorldToShadow[Face]);
+		if (ShadowPositionAsFloat4.w > 0)
+		{
+			ShadowPosition = ShadowPositionAsFloat4.xyz / ShadowPositionAsFloat4.w;
+			if (all(ShadowPosition.xyz > 0) || all(ShadowPosition.xy < 1))
+			{
+				float2 ShadowMapCoord = clamp(ShadowPosition.xy * ShadowMap.Resolution - 0.5, 0, ShadowMap.Resolution - 1);
+				float ShadowZ = length(TranslatedWorldPosition - ShadowMap.TranslatedWorldOrigin);
+				if (ShadowMap.bIsDirectionalLight)
+				{
+					ShadowZ = dot(ShadowMap.TranslatedWorldPlane.xyz, TranslatedWorldPosition) + ShadowMap.TranslatedWorldPlane.w;
+				}
+
+			#define BILINEAR_INTERPOLATION 1
+			#if BILINEAR_INTERPOLATION
+				// Bilinear interpolation of shadow data
+				int2 ShadowMapCoordX[4] =
+				{
+					clamp(ShadowMapCoord, 0, ShadowMap.Resolution - 1),
+					clamp(ShadowMapCoord + int2(1, 0), 0, ShadowMap.Resolution - 1),
+					clamp(ShadowMapCoord + int2(0, 1), 0, ShadowMap.Resolution - 1),
+					clamp(ShadowMapCoord + int2(1, 1), 0, ShadowMap.Resolution - 1)
+				};
+
+				float TransmittanceX[4] =
+				{
+					AVSM_Sample(ShadowMap, Face, ShadowMapCoordX[0], ShadowZ),
+					AVSM_Sample(ShadowMap, Face, ShadowMapCoordX[1], ShadowZ),
+					AVSM_Sample(ShadowMap, Face, ShadowMapCoordX[2], ShadowZ),
+					AVSM_Sample(ShadowMap, Face, ShadowMapCoordX[3], ShadowZ)
+				};
+
+				float2 Weight = frac(ShadowMapCoord);
+				float TransmittanceY0 = lerp(TransmittanceX[0], TransmittanceX[1], Weight.x);
+				float TransmittanceY1 = lerp(TransmittanceX[2], TransmittanceX[3], Weight.x);
+				Transmittance = lerp(TransmittanceY0, TransmittanceY1, Weight.y);
+			#else
+				Transmittance = AVSM_Sample(ShadowMap, Face, ShadowMapCoord, ShadowZ);
+			#endif
+			}
+		}
+	}
+
+	return Transmittance;
+}
+
+FAdaptiveVolumetricShadowMap GetAdaptiveVolumetricShadowMap()
+{
+	FAdaptiveVolumetricShadowMap ShadowMap;
+	for (int i = 0; i < 6; ++i)
+	{
+		ShadowMap.TranslatedWorldToShadow[i] = AVSM.TranslatedWorldToShadow[i];
+	}
+	ShadowMap.TranslatedWorldOrigin = AVSM.TranslatedWorldOrigin;
+	ShadowMap.TranslatedWorldPlane = AVSM.TranslatedWorldPlane;
+
+	ShadowMap.Resolution = AVSM.Resolution;
+	ShadowMap.NumShadowMatrices = AVSM.NumShadowMatrices;
+	ShadowMap.MaxSampleCount = AVSM.MaxSampleCount;
+	ShadowMap.bIsEmpty = AVSM.bIsEmpty;
+	ShadowMap.bIsDirectionalLight = AVSM.bIsDirectionalLight;
+
+	ShadowMap.IndirectionBuffer = AVSM.IndirectionBuffer;
+	ShadowMap.SampleBuffer = AVSM.SampleBuffer;
+	return ShadowMap;
+}
+
+FAdaptiveVolumetricShadowMap GetAdaptiveVolumetricShadowMapForCamera()
+{
+	FAdaptiveVolumetricShadowMap ShadowMap;
+#if USE_CAMERA_AVSM
+	for (int i = 0; i < 6; ++i)
+	{
+		ShadowMap.TranslatedWorldToShadow[i] = CameraAVSM.TranslatedWorldToShadow[i];
+	}
+	ShadowMap.TranslatedWorldOrigin = CameraAVSM.TranslatedWorldOrigin;
+	ShadowMap.TranslatedWorldPlane = CameraAVSM.TranslatedWorldPlane;
+
+	ShadowMap.Resolution = CameraAVSM.Resolution;
+	ShadowMap.NumShadowMatrices = CameraAVSM.NumShadowMatrices;
+	ShadowMap.MaxSampleCount = CameraAVSM.MaxSampleCount;
+	ShadowMap.bIsEmpty = CameraAVSM.bIsEmpty;
+	ShadowMap.bIsDirectionalLight = CameraAVSM.bIsDirectionalLight;
+
+	ShadowMap.IndirectionBuffer = CameraAVSM.IndirectionBuffer;
+	ShadowMap.SampleBuffer = CameraAVSM.SampleBuffer;
+#endif // USE_CAMERA_AVSM
+	return ShadowMap;
+}
+
+float AVSM_SampleTransmittance(
+	float3 TranslatedWorldPosition,
+	float3 LightTranslatedWorldPosition
+)
+{
+	FAdaptiveVolumetricShadowMap AdaptiveVolumetricShadowMap = GetAdaptiveVolumetricShadowMap();
+	return AVSM_SampleTransmittance(AdaptiveVolumetricShadowMap, TranslatedWorldPosition, LightTranslatedWorldPosition);
+}

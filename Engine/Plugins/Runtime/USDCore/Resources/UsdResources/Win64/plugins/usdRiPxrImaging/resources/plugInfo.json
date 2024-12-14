@@ -1,0 +1,39 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "UsdRiPxrImagingDisplayFilterAdapter": {
+                        "bases": [
+                            "UsdImagingPrimAdapter"
+                        ],
+                        "isInternal": true,
+                        "primTypeName": "PxrDisplayFilterPluginBase",
+                        "includeDerivedPrimTypes": true
+                    },
+                    "UsdRiPxrImagingIntegratorAdapter": {
+                        "bases": [
+                            "UsdImagingPrimAdapter"
+                        ],
+                        "isInternal": true,
+                        "primTypeName": "PxrIntegratorPluginBase",
+                        "includeDerivedPrimTypes" : true 
+                    },
+                    "UsdRiPxrImagingSampleFilterAdapter": {
+                        "bases": [
+                            "UsdImagingPrimAdapter"
+                        ],
+                        "isInternal": true,
+                        "primTypeName": "PxrSampleFilterPluginBase",
+                        "includeDerivedPrimTypes" : true 
+                    }
+                }
+            },
+            "LibraryPath": "../../../../../../../../Binaries/Win64/usd_usdRiPxrImaging.dll",
+            "Name": "usdRiPxrImaging",
+            "ResourcePath": "resources",
+            "Root": "..",
+            "Type": "library"
+        }
+    ]
+}

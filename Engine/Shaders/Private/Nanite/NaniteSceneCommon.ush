@@ -1,0 +1,70 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+
+#include "/Engine/Shared/NaniteDefinitions.h"
+#include "NaniteDataDecode.ush"
+
+#ifndef DISABLE_DISPLACEMENT_BOUNDS
+	#define DISABLE_DISPLACEMENT_BOUNDS 0
+#endif
+
+FInstanceSceneData GetInstanceSceneData(uint InstanceId, bool bCheckValid = true)
+{
+	return GetInstanceSceneData(InstanceId, Scene.GPUScene.InstanceDataSOAStride, bCheckValid);
+}
+
+FInstanceSceneData GetInstanceSceneData(inout FVisibleCluster VisibleCluster, bool bCheckValid = true)
+{
+	FInstanceSceneData InstanceData = GetInstanceSceneData( VisibleCluster.InstanceId, Scene.GPUScene.InstanceDataSOAStride, bCheckValid );
+
+#if NANITE_IMPOSTERS_SUPPORTED
+	// Couldn't have been stored so signals this is an imposter
+	if( VisibleCluster.Flags == (1 << NANITE_NUM_CULLING_FLAG_BITS) )
+	{
+		const uint MaxStreamingPages = 1 << 12;
+		VisibleCluster.PageIndex = MaxStreamingPages + (InstanceData.NaniteRuntimeResourceID & NANITE_MAX_GPU_PAGES_MASK);
+	}
+#endif
+
+	return InstanceData;
+}
+
+FInstanceDynamicData CalculateInstanceDynamicData( FNaniteView NaniteView, FInstanceSceneData InstanceData )
+{
+	float4x4 LocalToTranslatedWorld = DFFastToTranslatedWorld(InstanceData.LocalToWorld, NaniteView.PreViewTranslation);
+	float4x4 PrevLocalToTranslatedWorld = DFFastToTranslatedWorld(InstanceData.PrevLocalToWorld, NaniteView.PrevPreViewTranslation);
+
+	FInstanceDynamicData DynamicData;
+	DynamicData.LocalToTranslatedWorld = LocalToTranslatedWorld;
+	DynamicData.PrevLocalToTranslatedWorld = PrevLocalToTranslatedWorld;
+	DynamicData.bHasMoved = GetGPUSceneFrameNumber() == InstanceData.LastUpdateSceneFrameNumber;
+
+	return DynamicData;
+}
+
+float GetAbsMaxMaterialDisplacement(FPrimitiveSceneData PrimitiveData)
+{
+#if DISABLE_DISPLACEMENT_BOUNDS
+	return 0.0f;
+#else
+	return max(-PrimitiveData.MinMaterialDisplacement, PrimitiveData.MaxMaterialDisplacement);
+#endif
+}
+
+float GetMaxMaterialDisplacementExtent(FPrimitiveSceneData PrimitiveData, bool bFallbackRaster, bool bIsShadowPass)
+{
+	const bool bDisplacementEnabled = !bFallbackRaster || bIsShadowPass ||
+		(PrimitiveData.PixelProgrammableDistanceSquared <= 0.0f && PrimitiveData.MaterialDisplacementFadeOutSize <= 0.0f);
+	return bDisplacementEnabled ? GetAbsMaxMaterialDisplacement(PrimitiveData) : 0.0f;
+}
+
+float3 GetLocalMaxWPOExtent(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, bool bEnableWPO = true)
+{
+	const bool bHasAlwaysEvalWPOMaterial = (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_HAS_ALWAYS_EVALUATE_WPO_MATERIALS) != 0;
+	return (bEnableWPO || bHasAlwaysEvalWPOMaterial) ? abs(PrimitiveData.MaxWPOExtent * InstanceData.InvNonUniformScale) : (float3)0;
+}
+

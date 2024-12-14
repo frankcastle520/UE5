@@ -1,0 +1,14 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../NiagaraStatelessCommon.ush"
+
+float		SpriteRotationRate_Scale;
+float		SpriteRotationRate_Bias;
+
+void SpriteRotationRate_Simulate(inout FStatelessParticle Particle)
+{
+	const float RotationRate = RandomScaleBiasFloat(0, SpriteRotationRate_Scale, SpriteRotationRate_Bias);
+
+	Particle.SpriteRotation += Particle.Age * RotationRate;
+	Particle.PreviousSpriteRotation += Particle.PreviousAge * RotationRate;
+}

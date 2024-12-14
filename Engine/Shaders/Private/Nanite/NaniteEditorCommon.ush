@@ -1,0 +1,57 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../BinarySearch.ush"
+
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+
+ByteAddressBuffer MaterialHitProxyTable;
+
+#if USE_EDITOR_SHADERS
+Buffer<uint> EditorSelectedHitProxyIds;
+uint NumEditorSelectedHitProxyIds;
+#endif
+
+uint GetHitProxySearchId(FInstanceSceneData InstanceData, FVisibleCluster VisibleCluster, uint TriIndex)
+{
+	uint SearchId = 0xFFFFFFFFu;
+
+#if USE_EDITOR_SHADERS
+	BRANCH
+	if ((InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_EDITOR_DATA) != 0u)
+	{
+		SearchId = InstanceData.EditorData.HitProxyPacked;
+	}
+	else
+	{
+		FCluster ClusterData = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+		SearchId = GetMaterialHitProxyId(ClusterData, InstanceData.PrimitiveId, TriIndex, MaterialHitProxyTable);
+	}
+#endif
+
+	return SearchId;
+}
+
+bool IsInstanceSelected(FInstanceSceneData InstanceData, FVisibleCluster VisibleCluster, uint TriIndex)
+{
+	bool bIsSelected = false;
+
+#if USE_EDITOR_SHADERS
+	BRANCH
+	if ((InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_EDITOR_DATA) != 0u)
+	{
+		// We do not want to search for InstanceData.EditorData.HitProxyPacked in the selected hit proxy buffer, because
+		// this buffer will contain all instance IDs regardless of bIsSelected. Additional filtering would be needed in 
+		// AddRelevantHitProxiesToArray() in order to reduce this set to only contain selected entries, and performing a 
+		// search would be entirely unnecessary and much slower.
+		bIsSelected = InstanceData.EditorData.bIsSelected;
+	}
+	else if (NumEditorSelectedHitProxyIds > 0)
+	{
+		const uint SearchId = GetHitProxySearchId(InstanceData, VisibleCluster, TriIndex);
+		bIsSelected = BinarySearch(EditorSelectedHitProxyIds, 0, NumEditorSelectedHitProxyIds, SearchId);
+	}
+#endif
+
+	return bIsSelected;
+}

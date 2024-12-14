@@ -1,0 +1,15 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "CoreMinimal.h"
+
+namespace PropertyTreeConstants
+{
+	const FName ColumnId_Name( TEXT("Property") );
+	const FName ColumnId_Property( TEXT("Value") );
+
+	const FText ColumnText_Name( NSLOCTEXT("PropertyEditorWidgets", "Property", "Property") );
+	const FText ColumnText_Property( NSLOCTEXT("PropertyEditorWidgets", "Value", "Value") );
+}
+
+

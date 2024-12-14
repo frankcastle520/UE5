@@ -1,0 +1,8 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BuildGraph xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../Build/Graph/Schema.xsd" xmlns="http://www.epicgames.com/BuildGraph">
+  <Option Name="RunSwitchboardListenerTests" DefaultValue="" Description="Run SwitchboardListener Tests" />
+  <Property Name="TestNames" Value="$(TestNames);SwitchboardListener" />
+  <Extend Name="RunAllTests">
+    <Expand Name="DeployAndTest" Platform="Win64" TestName="SwitchboardListener" ShortName="SwitchboardListener" TargetName="SwitchboardListenerTests" BinaryRelativePath="Engine\Binaries" ReportType="console" />
+  </Extend>
+</BuildGraph>

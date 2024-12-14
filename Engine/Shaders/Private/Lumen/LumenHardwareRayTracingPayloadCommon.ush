@@ -1,0 +1,113 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "/Engine/Shared/LumenDefinitions.h"
+
+struct FLumenRayHitBookmark
+{
+	uint2 PackedData;
+};
+
+#define LUMEN_RAYHIT_BOOKMARK_MISS 0xFFFFFFFF
+
+#define MATERIAL_INDEX 0
+#define NORMAL_INDEX 1
+#define GPU_SCENE_INSTANCE_INDEX 2
+
+// #lumen_todo: Pack more aggressively. HitT - 2 bytes, GPUSceneIndex - 3 bytes, MaterialIndex - 3 bytes
+struct FLumenMinimalPayload : FMinimalPayload
+{
+	uint PackedData[3];
+
+	void SetIsTranslucent(uint bIsTranslucent)
+	{
+		PackedData[MATERIAL_INDEX] = (PackedData[MATERIAL_INDEX] & 0x7FFFFFFF) | ((bIsTranslucent & 0x01) << 31);
+	}
+
+	uint IsTranslucent()
+	{
+		uint bIsTranslucent = (PackedData[MATERIAL_INDEX] >> 31) & 0x1;
+		return bIsTranslucent;
+	}
+
+	void SetIsTwoSided(uint bIsTwoSided)
+	{
+		PackedData[MATERIAL_INDEX] = (PackedData[MATERIAL_INDEX] & 0xBFFFFFFF) | ((bIsTwoSided & 0x01) << 30);
+	}
+
+	uint IsTwoSided()
+	{
+		uint bIsTwoSided = (PackedData[MATERIAL_INDEX] >> 30) & 0x1;
+		return bIsTwoSided;
+	}
+
+	void SetIsShadowRay(uint bIsShadowRay)
+	{
+		PackedData[MATERIAL_INDEX] = (PackedData[MATERIAL_INDEX] & 0xDFFFFFFF) | ((bIsShadowRay & 0x01) << 29);
+	}
+
+	uint IsShadowRay()
+	{
+		uint bIsShadowRay = (PackedData[MATERIAL_INDEX] >> 29) & 0x1;
+		return bIsShadowRay;
+	}
+
+	void SetIsAlphaMasked(uint bIsAlphaMasked)
+	{
+		PackedData[MATERIAL_INDEX] = (PackedData[MATERIAL_INDEX] & 0xEFFFFFFF) | ((bIsAlphaMasked & 0x01) << 28);
+	}
+
+	uint IsAlphaMasked()
+	{
+		uint bIsAlphaMasked = (PackedData[MATERIAL_INDEX] >> 28) & 0x1;
+		return bIsAlphaMasked;
+	}
+
+	void SetFrontFace(bool bFrontFace)
+	{
+		PackedData[MATERIAL_INDEX] = (PackedData[MATERIAL_INDEX] & 0xF7FFFFFF) | ((bFrontFace ? 1u : 0u) << 27);
+	}
+
+	uint IsFrontFace()
+	{
+		uint bIsTwoSided = (PackedData[MATERIAL_INDEX] >> 27) & 0x1;
+		return bIsTwoSided;
+	}
+
+	void SetMaterialShaderIndex(uint MaterialShaderIndex)
+	{
+		PackedData[MATERIAL_INDEX] = (PackedData[MATERIAL_INDEX] & 0xFF000000) | (MaterialShaderIndex & LUMEN_MATERIAL_SHADER_INDEX_MASK);
+	}
+
+	uint GetMaterialShaderIndex()
+	{
+		uint MaterialShaderIndex = PackedData[MATERIAL_INDEX] & LUMEN_MATERIAL_SHADER_INDEX_MASK;
+		return MaterialShaderIndex;
+	}
+
+	void SetWorldNormal(float3 WorldNormal)
+	{
+		PackedData[NORMAL_INDEX] = PackNormalToUInt32(WorldNormal);
+	}
+
+	float3 GetWorldNormal()
+	{
+		return UnpackNormalFromUInt32(PackedData[NORMAL_INDEX]);
+	}
+
+	void SetGPUSceneInstanceIndex(uint GPUSceneInstanceIndex)
+	{
+		PackedData[GPU_SCENE_INSTANCE_INDEX] = GPUSceneInstanceIndex;
+	}
+
+	uint GetGPUSceneInstanceIndex()
+	{
+		return asint(PackedData[GPU_SCENE_INSTANCE_INDEX]);
+	}
+};
+
+#if IS_PAYLOAD_ENABLED(RT_PAYLOAD_TYPE_LUMEN_MINIMAL)
+	CHECK_RT_PAYLOAD_SIZE(FLumenMinimalPayload)
+#endif

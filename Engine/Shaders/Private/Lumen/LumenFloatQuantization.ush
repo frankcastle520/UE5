@@ -1,0 +1,37 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LumenFloatQuantization.ush: Utility that quantizes floats for writing to render targets
+=============================================================================*/
+
+#pragma once
+
+#include "../Random.ush"
+#include "../MonteCarlo.ush"
+
+// 2^(-NumMantissaBits)
+float3 TargetFormatQuantizationError;
+
+// TODO: this is copied from TSRCommon.ush. Maybe move this and the original implemetnation to a common ush
+float3 QuantizeForFloatRenderTarget(float3 Color, float E, const float3 QuantizationError)
+{
+	float3 Error = Color * QuantizationError;
+
+	Error[0] = asfloat(asuint(Error[0]) & ~0x007FFFFF);
+	Error[1] = asfloat(asuint(Error[1]) & ~0x007FFFFF);
+	Error[2] = asfloat(asuint(Error[2]) & ~0x007FFFFF);
+	
+	return Color + Error * E;
+}
+
+float3 QuantizeForFloatRenderTarget(float3 Color, float E)
+{
+	return QuantizeForFloatRenderTarget(Color, E, TargetFormatQuantizationError);
+}
+
+float3 QuantizeForFloatRenderTarget(float3 Color, int3 P)
+{
+	uint2 Random = Rand3DPCG16(P).xy;
+	float E = Hammersley16(0, 1, Random).x;
+	return QuantizeForFloatRenderTarget(Color, E);
+}

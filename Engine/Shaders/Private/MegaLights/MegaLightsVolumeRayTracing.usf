@@ -1,0 +1,204 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#define DISTANCE_FIELD_IN_VIEW_UB 1
+#include "../BlueNoise.ush"
+#include "../DistanceField/GlobalDistanceFieldShared.ush"
+#include "../DistanceField/GlobalDistanceFieldUtils.ush"
+#include "MegaLights.ush"
+#include "MegaLightsRayTracing.ush"
+#include "MegaLightsVolume.ush"
+
+uint VolumeDebugMode;
+uint3 VolumeSampleViewSize;
+float3 VolumeFrameJitterOffset;
+Texture3D<uint> VolumeLightSamples;
+
+RWBuffer<uint> RWCompactedTraceTexelData;
+RWBuffer<uint> RWCompactedTraceTexelAllocator;
+
+#ifdef VolumeCompactLightSampleTracesCS
+
+groupshared uint SharedGlobalTraceTexelStartOffset;
+
+#if WAVE_OPS
+	groupshared uint SharedGroupSum;
+#else
+	//@todo - ordered compaction for non-wave ops path
+	groupshared uint SharedTraceTexelAllocator;
+	groupshared uint SharedTraceTexels[THREADGROUP_SIZE * THREADGROUP_SIZE * THREADGROUP_SIZE];
+#endif
+
+#if COMPILER_SUPPORTS_WAVE_SIZE && WAVE_OPS
+	WAVESIZE(32)
+#endif
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void VolumeCompactLightSampleTracesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint LinearThreadIndex = GroupThreadId.z * THREADGROUP_SIZE * THREADGROUP_SIZE + GroupThreadId.y * THREADGROUP_SIZE + GroupThreadId.x;
+
+	if (LinearThreadIndex == 0)
+#if WAVE_OPS
+	{
+		SharedGroupSum = 0;
+	}
+#else
+	{
+		SharedTraceTexelAllocator = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+#endif
+
+	uint3 SampleCoord = DispatchThreadId.xyz;
+	bool bTraceValid = false;
+	uint TraceTexelForThisThread = 0;
+
+	if (all(SampleCoord < VolumeSampleViewSize))
+	{
+		// #ml_todo: try to preserve z-order here for improved tracing coherency
+		FLightSample LightSample = UnpackLightSample(VolumeLightSamples[SampleCoord]);
+
+		if (LightSample.LocalLightIndex != MAX_LOCAL_LIGHT_INDEX && !LightSample.bCompleted)
+		{
+			#if WAVE_OPS
+			{
+				bTraceValid = true;
+				TraceTexelForThisThread = PackTraceVoxel(SampleCoord);
+			}
+			#else
+			{
+				uint SharedTexelOffset;
+				InterlockedAdd(SharedTraceTexelAllocator, 1, SharedTexelOffset);
+				SharedTraceTexels[SharedTexelOffset] = PackTraceVoxel(SampleCoord);
+			}
+			#endif
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	#if WAVE_OPS
+	{
+		const uint LastLaneIndex = WaveGetLaneCount() - 1;
+		const uint LaneIndex = WaveGetLaneIndex();
+		const uint OffsetInWave = WavePrefixCountBits(bTraceValid);
+		uint OffsetInGroup = 0;
+
+		if (LaneIndex == LastLaneIndex)
+		{
+			const uint ThisWaveSum = OffsetInWave + (bTraceValid ? 1 : 0);
+			InterlockedAdd(SharedGroupSum, ThisWaveSum, OffsetInGroup);
+		}
+		OffsetInGroup = WaveReadLaneAt(OffsetInGroup, LastLaneIndex) + OffsetInWave;
+
+		GroupMemoryBarrierWithGroupSync();
+
+		// Allocate this group's compacted traces from the global allocator
+		if (LinearThreadIndex == 0)
+		{
+			InterlockedAdd(RWCompactedTraceTexelAllocator[0], SharedGroupSum, SharedGlobalTraceTexelStartOffset);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if (bTraceValid)
+		{
+			RWCompactedTraceTexelData[SharedGlobalTraceTexelStartOffset + OffsetInGroup] = TraceTexelForThisThread;
+		}
+	}
+	#else
+	{
+		if (LinearThreadIndex == 0)
+		{
+			InterlockedAdd(RWCompactedTraceTexelAllocator[0], SharedTraceTexelAllocator, SharedGlobalTraceTexelStartOffset);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if (LinearThreadIndex < SharedTraceTexelAllocator)
+		{
+			RWCompactedTraceTexelData[SharedGlobalTraceTexelStartOffset + LinearThreadIndex] = SharedTraceTexels[LinearThreadIndex];
+		}
+	}
+	#endif
+}
+
+#endif
+
+RWTexture3D<uint> RWVolumeLightSamples;
+RWTexture2D<float> RWLightSampleRayDistance;
+
+Buffer<uint> CompactedTraceTexelData;
+Buffer<uint> CompactedTraceTexelAllocator;
+uint VolumeDebugSliceIndex;
+
+#ifdef VolumeSoftwareRayTraceLightSamplesCS
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void VolumeSoftwareRayTraceLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TraceTexelIndex = DispatchThreadId.x;
+
+	if (TraceTexelIndex < CompactedTraceTexelAllocator[0])
+	{
+		const uint3 SampleCoord = UnpackTraceVoxel(CompactedTraceTexelData[TraceTexelIndex]);
+		const uint3 DownsampledVolumeCoord = SampleCoordToDownsampledVolumeCoord(SampleCoord);
+		const uint3 VolumeCoord = DownsampledVolumeCoordToVolumeCoord(DownsampledVolumeCoord);
+
+		FDebug Debug;
+		#if DEBUG_MODE
+		{
+			int2 DebugScreenCoord = GetDebugScreenCoord();
+			Debug.bActive = all(DownsampledVolumeCoord == int3(DebugScreenCoord >> MegaLightsVolumePixelSizeShift, VolumeDebugSliceIndex) / DOWNSAMPLE_FACTOR);
+			Debug.Context = InitShaderPrintContext(true, float2(0.5, 0.5));
+		}
+		#endif
+
+		float SceneDepth;
+		float3 TranslatedWorldPosition = ComputeCellTranslatedWorldPosition(VolumeCoord, VolumeFrameJitterOffset, SceneDepth);
+
+		FLightSample LightSample = UnpackLightSample(RWVolumeLightSamples[SampleCoord]);
+		const float2 LightSampleUV = BlueNoiseVec2(VolumeCoordToNoiseCoord(SampleCoord), MegaLightsStateFrameIndex);
+		FLightSampleTrace LightSampleTrace = GetLightSampleTrace(TranslatedWorldPosition, LightSample.LocalLightIndex, LightSampleUV);
+
+		FGlobalSDFTraceInput TraceInput = SetupGlobalSDFTraceInput(TranslatedWorldPosition, LightSampleTrace.Direction, 0.0f, LightSampleTrace.Distance, 1.0f, 1.0f);
+
+		// #ml_todo: setup bias
+		TraceInput.VoxelSizeRelativeBias = 0.5f;
+		TraceInput.VoxelSizeRelativeRayEndBias = 0.5f;
+		TraceInput.DitherScreenCoord = VolumeCoordToNoiseCoord(SampleCoord);
+
+		FGlobalSDFTraceResult SDFResult = RayTraceGlobalDistanceField(TraceInput);
+
+		const bool bHit = GlobalSDFTraceResultIsHit(SDFResult);
+		if (bHit)
+		{
+			LightSample.bVisible = false;
+			LightSample.bCompleted = true;
+			RWVolumeLightSamples[SampleCoord] = PackLightSample(LightSample);
+		}
+
+		#if DEBUG_MODE
+		if (Debug.bActive && VolumeDebugMode == DEBUG_MODE_VISUALIZE_TRACING)
+		{
+			const FLocalLightData LocalLightData = GetLocalLightDataNonStereo(LightSample.LocalLightIndex);
+			const FDeferredLightData LightData = ConvertToDeferredLight(LocalLightData);
+
+			float3 RayStart = TraceInput.TranslatedWorldRayStart + TraceInput.WorldRayDirection * TraceInput.MinTraceDistance;
+			float3 RayEnd = TraceInput.TranslatedWorldRayStart + TraceInput.WorldRayDirection * (bHit ? SDFResult.HitTime : TraceInput.MaxTraceDistance);
+			float4 RayColor = float4(LightData.Color.xyz / Luminance(LightData.Color.xyz), 1.0f);
+
+			AddLineTWS(Debug.Context, RayStart, RayEnd, RayColor);
+		}
+		#endif
+	}
+}
+
+#endif

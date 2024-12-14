@@ -1,0 +1,145 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	VulkanCommon.ush: Common Vulkan shader code
+=============================================================================*/
+
+#pragma once
+
+// Update this GUID to invalidate shader recompilation for only Vulkan shaders
+#pragma message("UESHADERMETADATA_VERSION 368AA5D0-57AB-4A02-BE50-0E3432A4820D")
+
+#define COMPILER_SUPPORTS_ULONG_TYPES 1
+#define COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS (1 && COMPILER_SUPPORTS_ULONG_TYPES)
+
+#if COMPILER_SUPPORTS_ULONG_TYPES
+
+#define UlongType uint64_t
+
+UlongType PackUlongType(uint2 Value)
+{
+	return ((UlongType)Value.y << 32) | Value.x;
+}
+
+uint2 UnpackUlongType(UlongType Value)
+{
+	return uint2(uint(Value), uint(Value >> 32));
+}
+
+#endif
+
+#if COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS
+void ImageInterlockedMaxUInt64(RWTexture2D<UlongType> Dest, uint2 Coord, UlongType Value)
+{
+	InterlockedMax(Dest[Coord], Value);
+}
+
+void ImageInterlockedAddUInt64(RWTexture2D<UlongType> Dest, uint2 Coord, UlongType Value)
+{
+	InterlockedAdd(Dest[Coord], Value);
+}
+#endif
+
+#if PLATFORM_SUPPORTS_BINDLESS
+	// While we use descriptor indexing, declare unbounded resource arrays
+	#define VULKAN_HEAP_NAME_INNER(Prefix, Type) Prefix##Type
+	#define VULKAN_HEAP_NAME(Prefix, Type) VULKAN_HEAP_NAME_INNER(Prefix, Type)
+	#define VULKAN_SAMPLER_HEAP(Type) VULKAN_HEAP_NAME(BINDLESS_SAMPLER_ARRAY_PREFIX,Type)
+	#define VULKAN_SRV_HEAP(Type) VULKAN_HEAP_NAME(BINDLESS_SRV_ARRAY_PREFIX,Type)
+	#define VULKAN_UAV_HEAP(Type) VULKAN_HEAP_NAME(BINDLESS_UAV_ARRAY_PREFIX,Type)
+
+	#if (RAYCALLABLESHADER || RAYHITGROUPSHADER || RAYGENSHADER || RAYMISSSHADER)
+		#define VULKAN_HEAP_ACCESS(BindlessIndex) NonUniformResourceIndex(BindlessIndex)
+	#else
+		#define VULKAN_HEAP_ACCESS(BindlessIndex) BindlessIndex
+	#endif
+
+	#define UB_RESOURCE_MEMBER_SRV(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		SafeType##UBName##_##Name VULKAN_SRV_HEAP(SafeType##UBName##_##Name)[]; \
+		Type GetBindlessResource##UBName##_##Name() { \
+			return VULKAN_SRV_HEAP(SafeType##UBName##_##Name)[VULKAN_HEAP_ACCESS(UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessSRV_, Name))]; \
+		} \
+		static const Type UBName##_##Name = GetBindlessResource##UBName##_##Name();
+
+	#define UB_RESOURCE_MEMBER_UAV(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		SafeType##UBName##_##Name VULKAN_UAV_HEAP(SafeType##UBName##_##Name)[]; \
+		Type GetBindlessResource##UBName##_##Name() { \
+			return VULKAN_UAV_HEAP(SafeType##UBName##_##Name)[VULKAN_HEAP_ACCESS(UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessUAV_, Name))]; \
+		} \
+		static const Type UBName##_##Name = GetBindlessResource##UBName##_##Name();
+
+	#define UB_RESOURCE_MEMBER_SAMPLER(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		SafeType##UBName##_##Name VULKAN_SAMPLER_HEAP(SafeType##UBName##_##Name)[]; \
+		Type GetBindlessSampler##UBName##_##Name() { \
+			return VULKAN_SAMPLER_HEAP(SafeType##UBName##_##Name)[VULKAN_HEAP_ACCESS(UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessSampler_, Name))]; \
+		} \
+		static const Type UBName##_##Name = GetBindlessSampler##UBName##_##Name();
+#endif
+
+#if VULKAN_SUPPORTS_SUBGROUP_SIZE_CONTROL
+	#define COMPILER_SUPPORTS_WAVE_SIZE 1
+
+	// NOTE: Wave size in Vulkan is supported at shader stage in the pipeline creation.
+	// Create something unique we can read back from the shader, but that goes away on the rewrite
+	COMPILER_DEFINE VULKAN_WAVESIZE(N)
+	#define WAVESIZE(N) VULKAN_WAVESIZE(N)
+#endif
+
+#if PLATFORM_SUPPORTS_BINDLESS && (RAYCALLABLESHADER || RAYHITGROUPSHADER || RAYGENSHADER || RAYMISSSHADER)
+	#define OVERRIDE_RAY_TRACING_HIT_GROUP_SYSTEM_RESOURCES 1
+	#include "/Engine/Shared/RayTracingBuiltInResources.h"
+
+	struct VulkanShaderRecordLooseParameterData
+	{
+		uint VulkanShaderRecordDummyGlobals;
+	};
+
+	// Combine the common FHitGroupSystemRootConstants with bindless parameters
+	// :todo-jn: must match with VulkanRayTracing.h decl until we create a common header like RayTracingBuiltInResources.h
+	struct FVulkanHitGroupSystemParameters
+	{
+		FHitGroupSystemRootConstants RootConstants;
+
+		uint BindlessHitGroupSystemIndexBuffer;
+		uint BindlessHitGroupSystemVertexBuffer;
+
+		uint BindlessUniformBuffers[32];
+
+		// Globals must be kept at the end of FVulkanHitGroupSystemParameters
+		VulkanShaderRecordLooseParameterData Globals;
+	};
+
+	[[vk::shader_record_ext]] ConstantBuffer<FVulkanHitGroupSystemParameters> VulkanHitGroupSystemParameters;
+
+	static const FHitGroupSystemRootConstants HitGroupSystemRootConstants = VulkanHitGroupSystemParameters.RootConstants;
+
+	// Will get filled in with the bindless index in VulkanHitGroupSystemParameters.BindlessHitGroupSystemIndexBuffer
+	ByteAddressBuffer HitGroupSystemIndexBuffer;
+	// Will get filled in with the bindless index in VulkanHitGroupSystemParameters.BindlessHitGroupSystemVertexBuffer
+	ByteAddressBuffer HitGroupSystemVertexBuffer;
+#endif
+
+#if PLATFORM_SUPPORTS_MESH_SHADERS_TIER0
+	#define MESH_SHADER_TRIANGLE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("triangle")]
+	#define MESH_SHADER_LINE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("line")]
+
+	#define AMPLIFICATION_SHADER_TRIANGLE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("triangle")]
+	#define AMPLIFICATION_SHADER_LINE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("line")]
+
+	#define MESH_SHADER_VERTEX_EXPORT(VertexType, InMaxVertexCount) out vertices VertexType OutVertices[InMaxVertexCount]
+	#define MESH_SHADER_TRIANGLE_EXPORT(InMaxTriangleCount) out indices uint3 OutTriangles[InMaxTriangleCount]
+	#define MESH_SHADER_LINE_EXPORT(InMaxLineCount) out indices uint2 OutLines[InMaxLineCount]
+
+	#define MESH_SHADER_WRITE_VERTEX(InVertexIndex, Value) OutVertices[InVertexIndex] = Value;
+	#define MESH_SHADER_WRITE_TRIANGLE(InTriangleIndex, Value) OutTriangles[InTriangleIndex] = Value;
+	#define MESH_SHADER_WRITE_LINE(InLineIndex, Value) OutLines[InLineIndex] = Value;
+#endif
+
+#if PLATFORM_SUPPORTS_MESH_SHADERS_TIER1
+	#define MESH_SHADER_PRIMITIVE_EXPORT(PrimitiveType, InMaxPrimitiveCount) out primitives PrimitiveType OutPrimitives[InMaxPrimitiveCount]
+
+	#define MESH_SHADER_WRITE_PRIMITIVE(InPrimitiveIndex, Value) OutPrimitives[InPrimitiveIndex] = Value;
+#endif

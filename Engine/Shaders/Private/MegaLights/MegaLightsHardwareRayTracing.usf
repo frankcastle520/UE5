@@ -1,0 +1,187 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Shared/RayTracingTypes.h"
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../SceneTexturesCommon.ush"
+#include "MegaLights.ush"
+#include "MegaLightsRayTracing.ush"
+#include "../Lumen/LumenHardwareRayTracingPayloadCommon.ush"
+#include "../Lumen/LumenHardwareRayTracingCommon.ush"
+#if HAIR_VOXEL_TRACES
+	#include "../HairStrands/HairStrandsRaytracing.ush"
+#endif
+
+float RayTracingBias;
+float RayTracingEndBias;
+float RayTracingNormalBias;
+float RayTracingPullbackBias;
+uint DebugMode;
+uint MaxTraversalIterations;
+uint MeshSectionVisibilityTest;
+RaytracingAccelerationStructure TLAS;
+
+#if LUMEN_HARDWARE_INLINE_RAYTRACING
+	StructuredBuffer<FHitGroupRootConstants> HitGroupData;
+	StructuredBuffer<FRayTracingSceneMetadataRecord> RayTracingSceneMetadata;
+#endif
+
+RWTexture2D<uint> RWLightSamples;
+Texture2D<uint> LightSampleUVTexture;
+
+Texture2D<float> LightSampleRayDistance;
+Buffer<uint> CompactedTraceTexelData;
+Buffer<uint> CompactedTraceTexelAllocator;
+Texture2D<float> DownsampledSceneDepth;
+Texture2D<UNORM float3> DownsampledSceneWorldNormal;
+
+RAY_TRACING_ENTRY_RAYGEN_OR_INLINE(HardwareRayTraceLightSamples)
+{
+	uint ThreadIndex = DispatchThreadIndex.x;
+	uint GroupIndex = DispatchThreadIndex.y;
+	uint TraceTexelIndex = GroupIndex * 64 + ThreadIndex;
+
+	if (TraceTexelIndex < CompactedTraceTexelAllocator[0])
+	{
+		uint2 SampleCoord = UnpackTraceTexel(CompactedTraceTexelData[TraceTexelIndex]);
+		uint2 ScreenCoord = SampleCoordToScreenCoord(SampleCoord);
+		uint2 DownsampledScreenCoord = SampleCoordToDownsampledScreenCoord(SampleCoord);
+
+#if DEBUG_MODE
+		FShaderPrintContext Context = InitShaderPrintContext(true, float2(0.55, 0.45));
+		int2 DebugScreenCoord = GetDebugScreenCoord();
+		bool bDebug = all(DebugScreenCoord / DOWNSAMPLE_FACTOR == DownsampledScreenCoord);
+#endif
+
+		float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+		float SceneDepth = DownsampledSceneDepth[DownsampledScreenCoord];
+		float3 SceneWorldNormal = normalize(DecodeNormal(DownsampledSceneWorldNormal[DownsampledScreenCoord]));
+		float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+
+		FLightSample LightSample = UnpackLightSample(RWLightSamples[SampleCoord]);
+		float2 LightSampleUV = UnpackLightSampleUV(LightSampleUVTexture[SampleCoord]);
+		FLightSampleTrace LightSampleTrace = GetLightSampleTrace(TranslatedWorldPosition, LightSample.LocalLightIndex, LightSampleUV);
+		const float LightSampleRayMinT = LightSampleRayDistance[SampleCoord];
+
+		FRayDesc Ray = (FRayDesc)0;
+		Ray.Origin = TranslatedWorldPosition;
+		Ray.Direction = LightSampleTrace.Direction;
+		Ray.TMin = max(LightSampleRayMinT - RayTracingPullbackBias, RayTracingBias);
+		Ray.TMax = max(Ray.TMin, LightSampleTrace.Distance - RayTracingEndBias);
+
+		ApplyPositionBias(Ray.Origin, Ray.Direction, SceneWorldNormal, RayTracingNormalBias);
+
+		FRayCone RayCone = (FRayCone)0;
+		FRayTracedLightingContext LightingContext = CreateRayTracedLightingContext(
+			RayCone,
+			0,
+			0, // dummy coordinate
+			/*CullingMode*/ RAY_FLAG_CULL_FRONT_FACING_TRIANGLES,
+			MaxTraversalIterations,
+			MeshSectionVisibilityTest != 0);
+
+		// Shadows don't need closest hit distance
+		LightingContext.bAcceptFirstHitAndEndSearch = true;
+
+#if LUMEN_HARDWARE_INLINE_RAYTRACING
+		LightingContext.HitGroupData = HitGroupData;
+		LightingContext.RayTracingSceneMetadata = RayTracingSceneMetadata;
+#endif // LUMEN_HARDWARE_INLINE_RAYTRACING
+
+		LightingContext.InstanceMask = RAY_TRACING_MASK_OPAQUE_SHADOW;
+		LightingContext.bIsShadowRay = true;
+
+#if DEBUG_MODE
+		// by default bIsShadowRay causes RAY_FLAG_SKIP_CLOSEST_HIT_SHADER to be used, but for visualizations we need CHS to run to get hit data such as HitT
+		LightingContext.bForceClosestHitShader = bDebug && DebugMode == DEBUG_MODE_VISUALIZE_TRACING;
+#endif
+
+#if MANY_LIGHTS_EVALUATE_MATERIALS
+		FLumenMinimalRayResult TraceResult = (FLumenMinimalRayResult)0;
+		{
+			FPackedMaterialClosestHitPayload Payload = (FPackedMaterialClosestHitPayload)0;
+			Payload.SetLumenPayload();
+			Payload.SetIgnoreTranslucentMaterials();
+			Payload.SetMinimalPayloadMode();
+
+			uint RayFlags = RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+			RayFlags |= LightingContext.CullingMode;
+			RayFlags |= LightingContext.bAcceptFirstHitAndEndSearch ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : 0;
+
+			TraceLumenShadingRay(TLAS, RayFlags, LightingContext.InstanceMask, RAY_TRACING_SHADER_SLOT_SHADOW, RAY_TRACING_NUM_SHADER_SLOTS, 0, Ray.GetNativeDesc(), Payload);
+
+			TraceResult.bHit = Payload.IsHit();
+			if (TraceResult.bHit)
+			{
+				TraceResult.HitT = Payload.HitT;
+			}
+		}
+#else
+		FLumenMinimalRayResult TraceResult = TraceLumenMinimalRay(TLAS, Ray, LightingContext);
+#endif
+
+		#if HAIR_VOXEL_TRACES
+		if (!TraceResult.bHit)
+		{
+			// #ml_todo: replace with spatiotemporal blue noise
+			RandomSequence RandSequence;
+			RandomSequence_Initialize(RandSequence, SampleCoord, 0, MegaLightsStateFrameIndex, 1);
+			const float HitT = TraverseHair(ScreenCoord, RandSequence, Ray.Origin, Ray.Direction, Ray.TMax, VirtualVoxel.Raytracing_ShadowOcclusionThreshold);
+			if (HitT > 0 && HitT < (TraceResult.bHit ? TraceResult.HitT : Ray.TMax))
+			{
+				TraceResult.HitT = HitT;
+				TraceResult.bHit = true;
+			}
+		}
+		#endif
+
+		#if DEBUG_MODE
+		if (bDebug && DebugMode == DEBUG_MODE_VISUALIZE_TRACING)
+		{
+			const FLocalLightData LocalLightData = GetLocalLightDataNonStereo(LightSample.LocalLightIndex);
+			const FDeferredLightData LightData = ConvertToDeferredLight(LocalLightData);
+
+			float3 RayStart = Ray.Origin + Ray.Direction * Ray.TMin;
+			float3 RayEnd = Ray.Origin + Ray.Direction * (TraceResult.bHit ? TraceResult.HitT : Ray.TMax);
+			float4 RayColor = float4(LightData.Color.xyz / Luminance(LightData.Color.xyz), 1.0f);
+
+#if MANY_LIGHTS_EVALUATE_MATERIALS
+			RayColor = ColorRed;
+#endif
+
+			if (TraceResult.bHit)
+			{
+				RayColor.xyz = 0.0f;
+			}
+
+			AddLineTWS(Context, RayStart, RayEnd, RayColor);
+			AddCrossTWS(Context, RayEnd, 2.0f, RayColor);
+		}
+		#endif
+
+#if SUPPORT_CONTINUATION
+		if (TraceResult.bAlphaMasked)
+		{
+			// do nothing so sample gets retraced with material evaluation
+			// can't shorten the retrace ray since this trace was done with bAcceptFirstHitAndEndSearch
+		}
+		else
+		{
+			LightSample.bCompleted = true; // mark sample as complete to skip continuation
+			if (TraceResult.bHit)
+			{
+				LightSample.bVisible = false;
+			}
+			RWLightSamples[SampleCoord] = PackLightSample(LightSample);
+		}
+#else
+		if (TraceResult.bHit) // if not using continuation, only need to write to RWLightSamples on hits
+		{
+			LightSample.bCompleted = true;
+			LightSample.bVisible = false;
+			RWLightSamples[SampleCoord] = PackLightSample(LightSample);
+		}
+#endif
+	}
+}

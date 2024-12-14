@@ -1,0 +1,378 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneTextureParameters.ush"
+#include "LumenReflectionCommon.ush"
+#include "LumenReflectionDenoiserCommon.ush"
+#if DEBUG_MODE
+	#include "../ShaderPrint.ush"
+#endif
+
+RWTexture2DArray<float3> RWSpecularIndirect;
+RWTexture2DArray<float> RWSpecularIndirectDepth;
+
+float2 ReflectionTracingBufferInvSize;
+Texture2DArray<uint> ResolveTileUsed;
+
+uint NumSpatialReconstructionSamples;
+float SpatialReconstructionKernelRadius;
+float SpatialReconstructionRoughnessScale;
+float SpatialReconstructionMinWeight;
+float SpatialReconstructionTonemapMode;
+float SpatialReconstructionTonemapStrength;
+float InvSubstrateMaxClosureCount;
+
+float3 TonemapLighting(float3 V)
+{
+	if (SpatialReconstructionTonemapMode == 2)
+	{
+		float Weight = 1.0f / (1.0f + SpatialReconstructionTonemapStrength * Luminance(V));
+		V = V * Weight;
+	}
+	else if (SpatialReconstructionTonemapMode == 1)
+	{
+		V = select(V <= 1.0f, V, sqrt(V));
+	}
+
+	return V;
+}
+
+float3 InverseTonemapLighting(float3 V)
+{
+	if (SpatialReconstructionTonemapMode == 2)
+	{
+		float InvWeight = 1.0f / (1.0f - SpatialReconstructionTonemapStrength * Luminance(V));
+		V = V * InvWeight;
+	}
+	else if (SpatialReconstructionTonemapMode == 1)
+	{
+		V = select(V <= 1.0f, V, Pow2(V));
+	}
+
+	return V;
+}
+
+[numthreads(REFLECTION_THREADGROUP_SIZE_2D, REFLECTION_THREADGROUP_SIZE_2D, 1)]
+void LumenReflectionResolveCS(
+	uint GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	FReflectionTileData TileData;
+	uint2 ScreenCoord = GetReflectionResolveScreenCoord(GroupId, GroupThreadId, TileData);
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoord_Reflection(ScreenCoord + View.ViewRectMinAndSize.xy, TileData);
+	const bool bIsOverflow = TileData.ClosureIndex > 0;
+
+#if DEBUG_MODE
+	int2 DebugScreenCoord = View.CursorPosition.x >= 0 ? View.CursorPosition * View.ViewResolutionFraction : -1;
+	bool bDebug = all(Coord.SvPosition == DebugScreenCoord);
+	FShaderPrintContext Context = InitShaderPrintContext(true, float2(0.2, 0.05));
+#endif
+
+	#if DEBUG_MODE
+	if (bDebug)
+	{
+		Print(Context, TEXT("ReflectionsResolve"));
+		Newline(Context);
+		Print(Context, TEXT("ScreenCoord: "));
+		Newline(Context);
+		Print(Context, Coord.SvPosition);
+		Newline(Context);
+	}
+	#endif
+
+	FLumenMaterialData Material = ApplySmoothBias(ReadMaterialData(Coord, MaxRoughnessToTrace), true /*bTopLayerRoughness*/);
+
+	// Mark invalid values with INVALID_LIGHTING for history accumulation
+	float3 ReflectionLighting = INVALID_LIGHTING;
+	float MinRayHitT = FLOAT_32_MAX;
+
+	if (NeedRayTracedReflections(Material.TopLayerRoughness, Material))
+	{
+		uint2 ReflectionScreenCoord = ScreenCoord;
+		uint3 ReflectionScreenCoord_Flatten = uint3(ReflectionScreenCoord, Coord.ClosureIndex);
+		ReflectionLighting = 0.0f;
+
+		float WeightSum = 0.0f;
+
+		// Center sample
+		#if DOWNSAMPLE_FACTOR == 1
+		{
+			ReflectionLighting = TonemapLighting(TraceRadiance[ReflectionScreenCoord_Flatten]);
+
+			bool bHit;
+			MinRayHitT = DecodeRayDistance(TraceHit[ReflectionScreenCoord_Flatten].x, bHit);
+
+			WeightSum += 1.0f;
+		}
+		#else
+		{
+			uint2 DownsampledScreenCoord00 = (max(ScreenCoord, View.ViewRectMinAndSize.xy + 1) - 1) / DOWNSAMPLE_FACTOR;
+			float3 DownsampledGatherUV;
+			DownsampledGatherUV.xy = (DownsampledScreenCoord00 + 0.5f) * ReflectionTracingBufferInvSize;
+			DownsampledGatherUV.z = (Coord.ClosureIndex + 0.5f) * InvSubstrateMaxClosureCount;
+
+			// We trace 1 sample out of 2x2. One can be copied directly. Other three need be reconstructed using bilinear filtering.
+			int2 ScreenCoordOffset = max(ScreenCoord, View.ViewRectMinAndSize.xy + 1) - DownsampledScreenCoord00 * DOWNSAMPLE_FACTOR;
+			int2 SampleOffset00 = GetScreenTileJitter() + uint2(0, 0) * DOWNSAMPLE_FACTOR - ScreenCoordOffset;
+			int2 SampleOffset10 = GetScreenTileJitter() + uint2(1, 0) * DOWNSAMPLE_FACTOR - ScreenCoordOffset;
+			int2 SampleOffset01 = GetScreenTileJitter() + uint2(0, 1) * DOWNSAMPLE_FACTOR - ScreenCoordOffset;
+			int2 SampleOffset11 = GetScreenTileJitter() + uint2(1, 1) * DOWNSAMPLE_FACTOR - ScreenCoordOffset;
+
+			float4 UpsampleWeights;
+			UpsampleWeights.x = (2.0f - abs(SampleOffset00.x)) * (2.0f - abs(SampleOffset00.y));
+			UpsampleWeights.y = (2.0f - abs(SampleOffset10.x)) * (2.0f - abs(SampleOffset10.y));
+			UpsampleWeights.z = (2.0f - abs(SampleOffset01.x)) * (2.0f - abs(SampleOffset01.y));
+			UpsampleWeights.w = (2.0f - abs(SampleOffset11.x)) * (2.0f - abs(SampleOffset11.y));
+
+			float4 UpsampleDepth4 = DownsampledDepth.GatherRed(GlobalPointClampedSampler, DownsampledGatherUV).wzxy;
+			float4 DepthWeights = select(UpsampleDepth4 > 0.0f, 1.0f, 0.0f);
+			UpsampleWeights *= DepthWeights;
+
+			if (any(UpsampleWeights > 0.01f))
+			{
+				float Epsilon = 0.001f;
+				UpsampleWeights /= max(dot(UpsampleWeights, 1), Epsilon);
+
+				float4 TraceRadiance4R = TraceRadiance.GatherRed(GlobalPointClampedSampler, DownsampledGatherUV).wzxy;
+				float4 TraceRadiance4G = TraceRadiance.GatherGreen(GlobalPointClampedSampler, DownsampledGatherUV).wzxy;
+				float4 TraceRadiance4B = TraceRadiance.GatherBlue(GlobalPointClampedSampler, DownsampledGatherUV).wzxy;
+
+				float3 TraceRadiance0 = TonemapLighting(float3(TraceRadiance4R.x, TraceRadiance4G.x, TraceRadiance4B.x));
+				float3 TraceRadiance1 = TonemapLighting(float3(TraceRadiance4R.y, TraceRadiance4G.y, TraceRadiance4B.y));
+				float3 TraceRadiance2 = TonemapLighting(float3(TraceRadiance4R.z, TraceRadiance4G.z, TraceRadiance4B.z));
+				float3 TraceRadiance3 = TonemapLighting(float3(TraceRadiance4R.w, TraceRadiance4G.w, TraceRadiance4B.w));
+
+				#if DEBUG_MODE
+				if (bDebug)
+				{
+					Print(Context, TEXT("UpsampleWeights: "));
+					Print(Context, UpsampleWeights);
+					Newline(Context);
+				}
+				#endif
+
+				ReflectionLighting = TraceRadiance0 * UpsampleWeights.x
+					+ TraceRadiance1 * UpsampleWeights.y 
+					+ TraceRadiance2 * UpsampleWeights.z
+					+ TraceRadiance3 * UpsampleWeights.w;
+
+				const float MaxUpsampleWeight = max(max(max(UpsampleWeights.x, UpsampleWeights.y), UpsampleWeights.z), UpsampleWeights.w);
+
+				// Select closest ReflectionScreenCoord_Flatten for trace hit distance calculation
+				if (MaxUpsampleWeight == UpsampleWeights.x)
+				{
+					ReflectionScreenCoord_Flatten.xy = DownsampledScreenCoord00 + uint2(0, 0);
+				}
+				else if (MaxUpsampleWeight == UpsampleWeights.y)
+				{
+					ReflectionScreenCoord_Flatten.xy = DownsampledScreenCoord00 + uint2(1, 0);
+				}
+				else if (MaxUpsampleWeight == UpsampleWeights.z)
+				{
+					ReflectionScreenCoord_Flatten.xy = DownsampledScreenCoord00 + uint2(0, 1);
+				}
+				else
+				{
+					ReflectionScreenCoord_Flatten.xy = DownsampledScreenCoord00 + uint2(1, 1);
+				}
+
+				bool bHit;
+				MinRayHitT = DecodeRayDistance(TraceHit[ReflectionScreenCoord_Flatten].x, bHit);
+
+				WeightSum += 1.0f;
+			}
+		}
+		#endif
+
+		#if USE_SPATIAL_RECONSTRUCTION
+		{
+			float KernelRadiusInPixels = DOWNSAMPLE_FACTOR * SpatialReconstructionKernelRadius * saturate(Material.TopLayerRoughness * 8.0f);
+
+			#if DEBUG_MODE
+			if (bDebug)
+			{
+				Newline(Context);
+				Print(Context, TEXT("Material.TopLayerRoughness: "));
+				Print(Context, Material.TopLayerRoughness);
+				Newline(Context);
+				Print(Context, TEXT("Material.Anisotropy: "));
+				Print(Context, Material.Anisotropy);
+				Newline(Context);
+				Print(Context, TEXT("KernelRadiusInPixels: "));
+				Print(Context, KernelRadiusInPixels);
+				Newline(Context);
+				Print(Context, TEXT("ReflectionLighting: "));
+				Print(Context, ReflectionLighting);
+				Newline(Context);
+				Print(Context, TEXT("WeightSum: "));
+				Print(Context, WeightSum);
+			}
+			#endif
+
+			// Skip reconstruction on mirror reflections
+			if (KernelRadiusInPixels > DOWNSAMPLE_FACTOR)
+			{
+				uint2 RandomSeed = Rand3DPCG16(int3(ScreenCoord, ReflectionsStateFrameIndexMod8)).xy;
+
+				const float2 ScreenUV = (Coord.SvPosition + 0.5f) * View.BufferSizeAndInvSize.zw;
+				const float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, Material.SceneDepth);
+				const float3 V = -normalize(TranslatedWorldPosition - PrimaryView.TranslatedWorldCameraOrigin);
+				const float3x3 TangentBasis = GetTangentBasis(Material);
+				const float3 TangentV = mul(TangentBasis, V);
+
+				const bool bHasAnisotropy = HasAnisotropy(Material);
+				const float EffectiveRoughness = clamp(Material.TopLayerRoughness * SpatialReconstructionRoughnessScale, 0.0f, 1.0f);
+				float2 ax_ay = Pow2(EffectiveRoughness).xx;
+				if (bHasAnisotropy)
+				{
+					GetAnisotropicRoughness(ax_ay.x, Material.Anisotropy, ax_ay.x, ax_ay.y);
+				}
+				const float a2 = ax_ay.x * ax_ay.y;
+
+				float2 KernelDiameter = KernelRadiusInPixels;
+				float2 KernelMajorAxis = float2(KernelDiameter.x,0);
+				float2 KernelMinorAxis = float2(0, KernelDiameter.y);
+
+				if (bHasAnisotropy)
+				{
+					// Scale filtering kernel based on the anisotropy scaling
+					KernelDiameter.x = max(KernelDiameter.x * (1.0 + Material.Anisotropy), DOWNSAMPLE_FACTOR);
+					KernelDiameter.y = max(KernelDiameter.y * (1.0 - Material.Anisotropy), DOWNSAMPLE_FACTOR);
+
+					// Orient filtering kernel along the projected major/minor axis
+					float4 ProjX = mul(float4(TranslatedWorldPosition + TangentBasis[0], 1), View.TranslatedWorldToClip);
+					float4 ProjY = mul(float4(TranslatedWorldPosition + TangentBasis[1], 1), View.TranslatedWorldToClip);
+					ProjX /= ProjX.w;
+					ProjY /= ProjY.w;
+					ProjX.xy = ProjX.xy * float2(0.5f, -0.5f) + 0.5f;
+					ProjY.xy = ProjY.xy * float2(0.5f, -0.5f) + 0.5f;
+
+					KernelMajorAxis = KernelDiameter.x * normalize(ProjX.xy * View.ViewSizeAndInvSize.xy - (Coord.SvPosition + 0.5f));
+					KernelMinorAxis = KernelDiameter.y * normalize(ProjY.xy * View.ViewSizeAndInvSize.xy - (Coord.SvPosition + 0.5f));
+				}
+
+				float CenterRayHitT = MinRayHitT;
+
+				#if DEBUG_MODE
+				if (bDebug)
+				{
+					Newline(Context);
+					Print(Context, TEXT("KernelMajorAxis: "));
+					Print(Context, KernelMajorAxis);
+					Newline(Context);
+					Print(Context, TEXT("KernelMinorAxis: "));
+					Print(Context, KernelMinorAxis);
+					Newline(Context);
+					Print(Context, TEXT("CenterRayHitT: "));
+					Print(Context, CenterRayHitT);
+				}
+				#endif
+
+				float3 NeighborSpecular = 0;
+				float NeighborSpecularWeightSum = 0.0f;
+
+				for (uint NeighborIndex = 0; NeighborIndex < NumSpatialReconstructionSamples; ++NeighborIndex)
+				{
+					float2 NeighborOffsetInRect = Hammersley16(NeighborIndex, NumSpatialReconstructionSamples, RandomSeed);
+					float2 NeighborOffset = UniformSampleDiskConcentric(NeighborOffsetInRect);
+					NeighborOffset = NeighborOffset.x * KernelMajorAxis + NeighborOffset.y * KernelMinorAxis;
+					int2 NeighborScreenCoord = (int2)(ScreenCoord + NeighborOffset + 0.5f);
+
+					int2 NeighborTracingCoord = NeighborScreenCoord / DOWNSAMPLE_FACTOR;
+					if (all(and(NeighborTracingCoord >= 0, NeighborTracingCoord < ReflectionTracingViewSize)))
+					{
+						int3 NeighborTracingCoord_Flatten = int3(NeighborTracingCoord, Coord.ClosureIndex);
+
+						// DownsampledDepth is valid discriminant to know if a pixel is valid (i.e. has initialized ray/luminance data)
+						float2 NeighborScreenUV = GetScreenUVFromReflectionTracingCoord(NeighborTracingCoord);
+						float NeighborSceneDepth = DownsampledDepth[NeighborTracingCoord_Flatten].x;
+
+						if (NeighborSceneDepth > 0.0f)
+						{
+							float3 NeighborTranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(NeighborScreenUV, NeighborSceneDepth);
+							FRayData RayData = GetRayData(NeighborTracingCoord_Flatten);
+
+							bool bHit;
+							float TraceHitDistance = DecodeRayDistance(TraceHit[NeighborTracingCoord_Flatten].x, bHit);
+
+							// Clamp to center distance - preserves contacts and prevents a bias toward trace that hit the background
+							TraceHitDistance = min(TraceHitDistance, CenterRayHitT);
+
+							float3 NeighborHitPosition = NeighborTranslatedWorldPosition + RayData.Direction * TraceHitDistance;
+							float DistanceToNeighborHit = length(NeighborHitPosition - TranslatedWorldPosition);
+							float3 DirectionToNeighborHit = RayData.Direction;
+
+							if (DistanceToNeighborHit > 0)
+							{
+								DirectionToNeighborHit = (NeighborHitPosition - TranslatedWorldPosition) / DistanceToNeighborHit;
+							}
+							float3 TangentH = mul(TangentBasis, normalize(V + DirectionToNeighborHit));
+
+							// Re-weight neighbor ray by the ratio of our PDF to neighbor PDF
+							float NewPDF = 1.f;
+							if (bHasAnisotropy)
+							{
+								NewPDF = min(VisibleGGXPDF_aniso(TangentV, TangentH, ax_ay), 1.0f / MinReflectionConeAngle);
+							}
+							else
+							{
+								NewPDF = min(VisibleGGXPDF(TangentV, TangentH, a2), 1.0f / MinReflectionConeAngle);
+							}
+
+							float SampleWeight = saturate(NewPDF / RayData.PDF);
+
+							#if DEBUG_MODE
+							if (bDebug)
+							{
+								Newline(Context);
+								Print(Context, TraceHitDistance);
+								Print(Context, SampleWeight);
+							}
+							#endif
+
+							if (SampleWeight > 1e-6)
+							{
+								float3 SampleRadiance = TonemapLighting(TraceRadiance[NeighborTracingCoord_Flatten]);
+								NeighborSpecular += SampleRadiance * SampleWeight;
+								NeighborSpecularWeightSum += SampleWeight;
+								MinRayHitT = min(MinRayHitT, TraceHitDistance);
+							}
+						}
+					}
+				}
+
+				// Re-weight neighborhood if we didn't find any good samples
+				if (NeighborSpecularWeightSum > 1e-6 && SpatialReconstructionMinWeight > NeighborSpecularWeightSum)
+				{
+					NeighborSpecular = (NeighborSpecular / NeighborSpecularWeightSum) * SpatialReconstructionMinWeight;
+					NeighborSpecularWeightSum = SpatialReconstructionMinWeight;
+				}
+				
+				ReflectionLighting += NeighborSpecular;
+				WeightSum += NeighborSpecularWeightSum;
+			}
+		}
+		#endif
+
+		if (WeightSum > 1e-6)
+		{
+			ReflectionLighting = ReflectionLighting / WeightSum;
+		}
+		ReflectionLighting = InverseTonemapLighting(ReflectionLighting);
+
+		#if DEBUG_MODE
+		if (bDebug)
+		{
+			Newline(Context);
+			Print(Context, TEXT("WeightSum: "));
+			Print(Context, WeightSum);
+			Newline(Context);
+			Print(Context, TEXT("ReflectionLighting: "));
+			Print(Context, ReflectionLighting);
+		}
+		#endif
+	}
+
+	RWSpecularIndirect[Coord.SvPositionFlatten] = ReflectionLighting;
+	RWSpecularIndirectDepth[Coord.SvPositionFlatten] = MinRayHitT;
+}

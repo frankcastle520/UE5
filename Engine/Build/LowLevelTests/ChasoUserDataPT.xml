@@ -1,0 +1,8 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BuildGraph xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../Build/Graph/Schema.xsd" xmlns="http://www.epicgames.com/BuildGraph">
+  <Option Name="RunChasoUserDataPTTests" DefaultValue="" Description="Run Chaos User Data PT Tests" />
+  <Property Name="TestNames" Value="$(TestNames);ChasoUserDataPT" />
+  <Extend Name="RunAllTests">
+    <Expand Name="DeployAndTest" Platform="Win64" TestName="ChasoUserDataPT" ShortName="Chaos User Data PT" TargetName="ChaosUserDataPTTests" BinaryRelativePath="Engine\Binaries" ReportType="console" />
+  </Extend>
+</BuildGraph>

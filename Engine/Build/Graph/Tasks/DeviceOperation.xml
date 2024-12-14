@@ -1,0 +1,52 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../Schema.xsd" >
+
+	<Include Script="Inc/SharedProperties.xml"/>
+	
+	<Option Name="InstallBuildFlags" DefaultValue="" Description="Optional BuildFlags used to specific a type of build to install."/>
+	<Option Name="ProjectName" DefaultValue="" Description="The Project Name of the build."/>
+
+	<Option Name="InstallBuildAgent" DefaultValue="DevkitAutomation" Description="Name of agent pool"/>
+	
+	<Option Name="Configurations" DefaultValue="" Description="The Configurations of the build."/>
+	<Option Name="WithShipping" DefaultValue="false" Restrict="true|false" Description="With Shipping Configuration."/>
+	<Property Name="Configurations" Value="$(Configurations);Shipping" If="$(WithShipping)"/>
+	<Option Name="WithTest" DefaultValue="false" Restrict="true|false" Description="With Test Configuration."/>
+	<Property Name="Configurations" Value="$(Configurations);Test" If="$(WithTest)"/>
+	<Option Name="WithDevelopment" DefaultValue="true" Restrict="true|false" Description="With Development Configuration."/>
+	<Property Name="Configurations" Value="$(Configurations);Development" If="$(WithDevelopment)"/>
+
+	<Option Name="BranchTag" DefaultValue="" Description="The tag to the branch."/>
+	<Property Name="BranchTag" Value="$(EscapedBranch)" If="'$(BranchTag)' == ''"/>
+	<Property Name="NetworkPublishDir" Value="$(NetworkPublishRoot)/$(BranchTag)"/>
+	<Option Name="PublishBuildDir" DefaultValue="$(NetworkPublishDir)" Description="The path to the build."/>
+	<Option Name="BuildTag" DefaultValue="" Description="The tag to the build."/>
+	<Option Name="BuildVersion" DefaultValue="" Description="The version to the build."/>
+	<Property Name="BuildTag" Value="$(ProjectName)-CL-$(BuildVersion)" If="'$(BuildTag)' == ''"/>
+
+	<Property Name="TargetRemotePlatforms" Value=""/>
+	<Property Name="InstallTasks" Value=""/>
+	<Macro Name="AddPlatform" Arguments="Platform;IsConsole;IsEnabled" OptionalArguments="IsVirtualized">
+		<Property Name="IsVirtualized" Value="('$(IsVirtualized)' != '' and '$(IsVirtualized)' != 'false')"/>
+		<Property Name="InstallTasks" Value="$(InstallTasks);InstallBuild $(Platform)" If="$(IsEnabled) And $(IsConsole) And !$(IsVirtualized)"/>
+		<Property Name="TargetRemotePlatforms" Value="$(TargetRemotePlatforms);$(Platform)" If="$(IsConsole) And !$(IsVirtualized)"/>
+	</Macro>
+	<!-- Include any scripts from platform extensions -->
+	<Include Script="../../../Platforms/*/Build/Inc/PlatformOptions.xml"/>
+
+	<Option Name="DeviceList" DefaultValue="" Description="List of device to use."/>
+	<Option Name="ExtraInstallArgs" DefaultValue="" Description="Additional install arguments."/>
+	
+	<Agent Name="Install Build Job" Type="$(InstallBuildAgent)">
+		<ForEach Name="TargetPlatform" Values="$(TargetRemotePlatforms)">
+			<Node Name="InstallBuild $(TargetPlatform)">
+			<ForEach Name="Configuration" Values="$(Configurations)">
+				<Command Name="InstallUnrealBuild" Arguments="-platform=$(TargetPlatform) $(InstallBuildFlags) -configuration=$(Configuration) -project=$(ProjectName) -device=$(DeviceList) -path=&quot;$(PublishBuildDir)/$(BuildTag)&quot; $(ExtraInstallArgs)"/>
+			</ForEach>
+			</Node>
+		</ForEach>
+	</Agent>
+
+	<Aggregate Name="Install Build" Requires="$(InstallTasks)"/>
+
+</BuildGraph>

@@ -1,0 +1,24 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+namespace HordeAgent.Utility;
+
+/// <summary>
+/// Encodes version by replacing the version pattern below
+/// Platform-specific binaries built for Linux and macOS do not encode this information like Windows binaries do
+/// </summary>
+
+public static class VersionInfo
+{
+	/// <summary>
+	/// Version (the pattern is replaced prior to compilation)
+	/// </summary>
+	private const string VersionConstant = "$VERSION$";
+
+	/// <summary>
+	/// Version of this Horde Agent
+	/// </summary>
+	public static string Version
+	{
+		get => String.IsNullOrEmpty(VersionConstant) ? "unknown" : VersionConstant;
+	}
+}

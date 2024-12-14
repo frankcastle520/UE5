@@ -1,0 +1,163 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../PathTracingCommon.ush"
+
+float3 CloudClipX;
+float3 CloudClipY;
+float3 CloudClipZ;
+
+float3 CloudClipCenterKm;
+
+float CloudLayerBotKm;
+float CloudLayerTopKm;
+float CloudClipDistKm;
+float CloudClipRadiusKm;
+
+float CloudTracingMaxDistance;
+float CloudRoughnessCutoff;
+int CloudAccelMapResolution;
+int CloudCallableShaderId;
+uint3 CloudMapResolution;
+
+float3x3 GetCloudClipBasis()
+{
+	return float3x3(CloudClipX, CloudClipY, CloudClipZ);
+}
+
+float GetLowestCloudZ()
+{
+	return sqrt(max(CloudLayerBotKm * CloudLayerBotKm - CloudClipDistKm * CloudClipDistKm * 2.0, 0.0));
+}
+
+float GetFarthestCornerDist()
+{
+	return sqrt(2 * CloudClipDistKm * CloudClipDistKm + max(Square(GetLowestCloudZ() - CloudClipRadiusKm), Square(CloudLayerTopKm - CloudClipRadiusKm)));
+}
+
+float2 GetRadiusBounds()
+{
+	float2 RBounds = float2(0, GetFarthestCornerDist());
+	float CloudLoKm = GetLowestCloudZ();
+	if (CloudClipRadiusKm < CloudLoKm)
+	{
+		RBounds.x = CloudLoKm - CloudClipRadiusKm;
+	}
+	else if (CloudClipRadiusKm > CloudLayerTopKm)
+	{
+		RBounds.x = CloudClipRadiusKm - CloudLayerTopKm;
+	}
+	return RBounds;
+}
+
+#define CLOUD_MAPPING_TYPE   2
+
+
+float3 GetCloudClipPosFromUVW(float3 UVW)
+{
+#if CLOUD_MAPPING_TYPE == 0
+	// super basic voxelization for debugging
+	const float3 Corner0 = float3(-CloudClipDistKm.xx, GetLowestCloudZ());
+	const float3 Corner1 = float3(+CloudClipDistKm.xx, CloudLayerTopKm  );
+	return lerp(Corner0, Corner1, UVW);
+#elif CLOUD_MAPPING_TYPE == 1 || CLOUD_MAPPING_TYPE == 2
+	const float3 Corner0 = float3(-CloudClipDistKm.xx, GetLowestCloudZ());
+	const float3 Corner1 = float3(+CloudClipDistKm.xx, CloudLayerTopKm  );
+
+
+	float SliceDist = abs(GetLowestCloudZ() - CloudClipRadiusKm);
+
+	float2 Angle0 = atan2(Corner0.xy, SliceDist);
+	float2 Angle1 = atan2(Corner1.xy, SliceDist);
+	float3 CloudClipPos = float3(SliceDist * tan(lerp(Angle0, Angle1, UVW.xy)), 0.0);
+
+#if CLOUD_MAPPING_TYPE == 1
+	// angular mapping
+	const float ColumnDist = length(CloudClipPos.xy);
+	const float AngleZ0 = atan2(Corner0.z, ColumnDist);
+	const float AngleZ1 = atan2(Corner1.z, ColumnDist);
+	CloudClipPos.z = ColumnDist * tan(lerp(AngleZ0, AngleZ1, UVW.z));
+#else
+	// linear mapping
+	CloudClipPos.z = lerp(Corner0.z, Corner1.z, UVW.z);
+#endif
+
+
+	return CloudClipPos;
+
+#else
+#error "Unknown cloud mapping type"
+#endif
+}
+
+float3 GetUVWFromCloudClipPos(float3 CloudClipPos)
+{
+#if CLOUD_MAPPING_TYPE == 0
+	// super basic voxelization for debugging
+	const float3 Corner0 = float3(-CloudClipDistKm.xx, GetLowestCloudZ());
+	const float3 Corner1 = float3(+CloudClipDistKm.xx, CloudLayerTopKm  );
+	return saturate((CloudClipPos - Corner0) / (Corner1 - Corner0)) * 0.99999994;
+#elif CLOUD_MAPPING_TYPE == 1 || CLOUD_MAPPING_TYPE == 2
+	const float3 Corner0 = float3(-CloudClipDistKm.xx, GetLowestCloudZ());
+	const float3 Corner1 = float3(+CloudClipDistKm.xx, CloudLayerTopKm  );
+
+	float SliceDist = abs(GetLowestCloudZ() - CloudClipRadiusKm);
+
+	float2 Angle0 = atan2(Corner0.xy, SliceDist);
+	float2 Angle1 = atan2(Corner1.xy, SliceDist);
+
+	float2 UV = (atan2(CloudClipPos.xy, SliceDist) - Angle0) / (Angle1 - Angle0);
+
+#if CLOUD_MAPPING_TYPE == 1
+	// angular mapping
+	const float ColumnDist = length(CloudClipPos.xy);
+	const float AngleZ0 = atan2(Corner0.z, ColumnDist);
+	const float AngleZ1 = atan2(Corner1.z, ColumnDist);
+	const float W = (atan2(CloudClipPos.z, ColumnDist) - AngleZ0) / (AngleZ1 - AngleZ0);
+#else
+	// linear mapping
+	const float W = (CloudClipPos.z - Corner0.z) / (Corner1.z - Corner0.z);
+#endif
+
+	return saturate(float3(UV, W));
+#else
+#error "Unknown cloud mapping type"
+#endif
+}
+
+
+
+// Simplified struct only used in the cloud case (to reduce the amount of data needed in the payload for the callable shader)
+struct FSampleCloudMaterialResult
+{
+	float3 Extinction;
+	float3 Albedo;
+	float3 EmissiveColor;
+	float PhaseG1;
+	float PhaseG2;
+	float PhaseBlend;
+};
+
+FSampleCloudMaterialResult DecodeCloudResult(uint4 Data)
+{
+	FSampleCloudMaterialResult Result = (FSampleCloudMaterialResult) 0;
+	Result.Extinction    = PayloadDecodeHDRColor(Data.x) * (1.0 / 64.0);
+	Result.Albedo        = PayloadDecodeLDRColor(Data.y);
+	Result.EmissiveColor = PayloadDecodeHDRColor(Data.z);
+	float3 PhaseData     = PayloadDecodeLDRColor(Data.w) * float3(2.0, 2.0, 1.0) - float3(1.0, 1.0, 0.0);
+	Result.PhaseG1       = PhaseData.x;
+	Result.PhaseG2       = PhaseData.y;
+	Result.PhaseBlend    = PhaseData.z;
+	return Result;
+}
+
+uint4 EncodeCloudResult(FSampleCloudMaterialResult Result)
+{
+	return uint4(
+		PayloadEncodeHDRColor(Result.Extinction * 64.0), // scale up so we don't loose any density when clipping bits and make better use of the higher range of the encoding
+		PayloadEncodeLDRColor(Result.Albedo),
+		PayloadEncodeHDRColor(Result.EmissiveColor),
+		PayloadEncodeLDRColor(float3(Result.PhaseG1, Result.PhaseG2, Result.PhaseBlend) * float3(0.5, 0.5, 1.0) + float3(0.5, 0.5, 0.0))
+	);
+}

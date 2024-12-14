@@ -1,0 +1,115 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LumenCardTileShadowDownsampleFactor.ush: Tracks whether surface tiles were uniformly shadowed in the last lighitng update
+=============================================================================*/
+
+#pragma once
+
+#define LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS 8
+#define LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS_MASK (LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS * 32 - 1u)
+
+Buffer<uint> TileShadowDownsampleFactorAtlas;
+
+bool LumenCardTileHasUniformVisibilityToLight(uint TileIndexInPhysicalAtlas, uint PersistentLightId)
+{
+	uint BitIndex = PersistentLightId & LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS_MASK;
+	uint DwordIndex = LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS * TileIndexInPhysicalAtlas + BitIndex / 32;
+
+	uint MaskPart = TileShadowDownsampleFactorAtlas[DwordIndex];
+	return BitFieldExtractU32(MaskPart, 1, BitIndex % 32) != 0;
+}
+
+bool LumenCardTileHasUniformVisibilityToLight(uint2 TilePhysicalAtlasCoord, uint PhysicalAtlasWidthInTiles, uint PersistentLightId)
+{
+	uint TileIndex = TilePhysicalAtlasCoord.y * PhysicalAtlasWidthInTiles + TilePhysicalAtlasCoord.x;
+	return LumenCardTileHasUniformVisibilityToLight(TileIndex, PersistentLightId);
+}
+
+Buffer<uint4> TileShadowDownsampleFactorAtlasForResampling;
+
+void LoadLumenCardTileShadowDownsampleFactor(out uint4 FactorLow, out uint4 FactorHigh, uint TileIndexInPhysicalAtlas)
+{
+	uint ReadOffset = LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS / 4 * TileIndexInPhysicalAtlas;
+	FactorLow = TileShadowDownsampleFactorAtlasForResampling[ReadOffset];
+	FactorHigh = TileShadowDownsampleFactorAtlasForResampling[ReadOffset + 1];
+}
+
+void LoadLumenCardTileShadowDownsampleFactor(out uint4 FactorLow, out uint4 FactorHigh, uint2 TilePhysicalAtlasCoord, uint PhysicalAtlasWidthInTiles)
+{
+	uint TileIndex = TilePhysicalAtlasCoord.y * PhysicalAtlasWidthInTiles + TilePhysicalAtlasCoord.x;
+	LoadLumenCardTileShadowDownsampleFactor(FactorLow, FactorHigh, TileIndex);
+}
+
+float3 GetLumenCardTileShadowDownsampleFactorVisualizationColor(uint2 TilePhysicalAtlasCoord, uint PhysicalAtlasWidthInTiles)
+{
+	uint4 FactorLow;
+	uint4 FactorHigh;
+	LoadLumenCardTileShadowDownsampleFactor(FactorLow, FactorHigh, TilePhysicalAtlasCoord, PhysicalAtlasWidthInTiles);
+
+	uint NumTrackedLights = 0;
+	for (uint Index = 0; Index < 4; ++Index)
+	{
+		NumTrackedLights += countbits(FactorLow[Index]);
+		NumTrackedLights += countbits(FactorHigh[Index]);
+	}
+
+	float3 Color;
+	switch (NumTrackedLights)
+	{
+	case 0:
+		Color = float3(0.5, 0.5, 0.5);
+		break;
+	case 1:
+		Color = float3(0, 0, 1);
+		break;
+	case 2:
+		Color = float3(0, 1, 0);
+		break;
+	case 3:
+		Color = float3(0, 1, 1);
+		break;
+	case 4:
+		Color = float3(1, 0, 1);
+		break;
+	case 5:
+		Color = float3(1, 1, 0);
+		break;
+	default:
+		Color = float3(1, 0, 0);
+		break;
+	}
+
+	return Color;
+}
+
+RWBuffer<uint4> RWTileShadowDownsampleFactorAtlas;
+
+void WriteLumenCardTileShadowDownsampleFactor(uint4 FactorLow, uint4 FactorHigh, uint TileIndexInPhysicalAtlas)
+{
+	uint WriteOffset = LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS / 4 * TileIndexInPhysicalAtlas;
+	RWTileShadowDownsampleFactorAtlas[WriteOffset] = FactorLow;
+	RWTileShadowDownsampleFactorAtlas[WriteOffset + 1] = FactorHigh;
+}
+
+void WriteLumenCardTileShadowDownsampleFactor(uint4 FactorLow, uint4 FactorHigh, uint2 TilePhysicalAtlasCoord, uint PhysicalAtlasWidthInTiles)
+{
+	uint TileIndex = TilePhysicalAtlasCoord.y * PhysicalAtlasWidthInTiles + TilePhysicalAtlasCoord.x;
+	WriteLumenCardTileShadowDownsampleFactor(FactorLow, FactorHigh, TileIndex);
+}
+
+void SetLumenCardTileShadowDownsampleFactorForLight(inout uint4 FactorLow, inout uint4 FactorHigh, uint PersistentLightId)
+{
+	uint BitIndex = PersistentLightId & LUMEN_CARD_TILE_SHADOW_DOWNSAMPLE_FACTOR_DWORDS_MASK;
+	uint DwordIndex = BitIndex / 32;
+	uint Mask = 1u << BitIndex % 32;
+
+	if (DwordIndex < 4)
+	{
+		FactorLow[DwordIndex] |= Mask;
+	}
+	else
+	{
+		FactorHigh[DwordIndex - 4] |= Mask;
+	}
+}

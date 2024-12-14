@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<html>
+<style>
+	
+</style>
+<head>
+	<title>ROBOMERGE all bots</title>
+	<link rel="icon" href="/img/robo-r.png" type="image/png">
+
+
+	<script src="/js/jquery-3.4.1.min.js"></script>
+	<script src="/js/bootstrap.bundle.min.js"></script>
+	<script src="/js/hpcc-wasm-index.min.js"></script>
+	<script src="/js/flow.graph.js"></script>
+	<script src="/js/flow.js"></script>
+	<script src="/js/botselect.js"></script>
+	<script src="/js/allbots.js"></script>
+
+
+	<link rel="stylesheet" href="/css/bootstrap.min.css">
+	<link rel="stylesheet" href="/css/main.css">
+	<link rel="stylesheet" href="/css/botselect.css">
+	<link rel="stylesheet" href="/css/graphcontrolpanel.css">
+
+	<script>
+		$.ajax({
+			url: '/api/branches',
+			type: 'get',
+			dataType: 'json',
+			success: requestData => {
+				data = requestData;
+
+		
+				const bots = location.search.match(/bots=([^&]*)/);
+				const allBots = getAllBots(data.branches);
+
+				populateControlPanel(bots ? bots[1].split(',') : [],
+								     allBots ? Array.from(allBots) : []);
+
+				const reload = !!location.search.match(/reload/i);
+				if (reload)
+				{
+					document.getElementById('controlpanel').open = true;
+				}
+
+				$(() => $('#graph').append(showFlowGraph(data.branches, {
+					aliases: new Map([...data.botStates].map(([botName, botState]) => [botName, botState.aliases])),
+					botNames: bots ? bots[1].split(',') : [],
+					...parseOptions(location.search)
+				})));
+			},
+			error: function(xhr, error, status) {
+				window.location = window.origin + "/login?redirect=/allbots";
+			}
+		})
+	</script>
+</head>
+<body>
+	<header><a href="javascript:window.location.href=window.location.origin;"><img src="/img/logo.png"></a></header>
+	<div class="container-fluid no-gutters">
+		<details id="controlpanel" class="graphcontrolpanel">
+			<summary>Graph Control Panel</summary>
+			<div class="row p-1">
+				<div class="col-4">
+					<div class="row align-items-center justify-content-start">
+						<div class="col-2">
+							<button type="button" class="btn btn-light p-1" onclick="reloadData()" title="Reload branches data from the server.">Reload data</button>		
+						</div>	
+						<div class="col-10">
+							<div class="align-middle d-inline">
+								<button type="button" class="btn btn-light p-1" onclick="copyURL()" title="Copy parameters to clipboard.">
+									<img src="/img/clipboard.png" alt="Copy to clipboard" width="12">
+								</button>
+							</div>
+							<div class="align-middle d-inline">
+								<a id="share-url" href="url" target="_blank">placeholder</a>
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+			<div class="row m-1">
+				<div class="col-2 border rounded">
+					<div class="row">
+						<div class="col">
+							<p class="font-weight-bold">General Parameters</p>
+						</div>
+					</div>
+					<div class="row form-check">
+						<div class="col">
+							<input class="form-check-input" type="checkbox" id="hideDisconnected" name="hideDisconnected" value="hideDisconnected">
+							<label for="hideDisconnected" title="Hide nodes with no edges">Hide Disconnected</label>	
+						</div>
+					</div>
+					<div class="row form-check">
+						<div class="col">
+							<input class="form-check-input" type="checkbox" id="noGroups" name="noGroups" value="noGroups">
+							<label  for="noGroups"  title="Relevant if showing multiple bots: suppress boxes grouping each bot">No Groups</label>	
+						</div>
+					</div>
+					<div class="row form-check">
+						<div class="col">
+							<input class="form-check-input" type="checkbox" id="showOnlyForced" name="showOnlyForced" value="showOnlyForced" >
+							<label  for="showOnlyForced" title="Omit any 'on demand' (dotted gray) edges">Show Only Forced</label>
+						</div>
+					</div>
+				</div>
+				<div class="col-4 border rounded">
+					<div class="row">
+						<div class="col">
+							<p class="font-weight-bold">Bots Selection</p>
+						</div>
+					</div>
+					<div class="row">
+						<div id="allBotsBotselect"></div>
+					</div>
+					<div class="row">
+						<div class="col">
+							<button type="button" class="btn btn-light p-1" onclick="clearBotsSelection()" title="Clear current selection, default to all bots.">Clear</button>
+						</div>
+					</div>
+				</div>
+				<div class="col-2 border rounded">
+					<div class="row">
+						<div class="col">
+							<p class="font-weight-bold">Graph Legend</p>
+						</div>
+					</div>
+					<div class="row">
+						<div class="col">
+							<div id="graph-key-template" class="graph-key">
+								<span>Branch paths</span>
+								<table>
+									<tr title="Changes are automatically merged">
+										<td class="arrow auto-merge-arrow"></td>
+										<td class="arrow-label">Auto merge</td>
+									</tr>
+									<tr title="Changes are automatically merged but only up to the point specified by a gate file">
+										<td class="arrow gated-auto-merge-arrow"></td>
+										<td class="arrow-label">Gated auto merge</td>
+									</tr>
+									<tr title="Only changes with relevant #robomerge tags are merged">
+										<td class="arrow on-request-arrow"></td>
+										<td class="arrow-label">Merge on request</td>
+									</tr>
+									<tr title="Like merge on request, but will refuse to integrate .uasset or .umap files">
+										<td class="arrow block-assets-arrow"></td>
+										<td class="arrow-label">Block assets</td>
+									</tr>
+									<tr title="Branches to merge by default, ignored if any branches or other tags specified">
+										<td class="arrow default-flow-arrow"></td>
+										<td class="arrow-label">Default flow</td>
+									</tr>
+								</table>
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+		</details>
+
+		<div class="row m-1 flex-row flex-nowrap">
+			<div class="col">
+				<div class="row" id="graph">
+				</div>
+			</div>
+		</div>
+	</div>
+</body>

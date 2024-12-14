@@ -1,0 +1,39 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "/Plugin/FX/Niagara/Private/NiagaraQuaternionUtils.ush"
+
+struct FNiagaraTransform
+{
+	float3	Translation;
+	float4	Rotation;
+	float3	Scale;
+};
+
+FNiagaraTransform LoadTransform(ByteAddressBuffer RawBufferData, uint Offset)
+{
+	FNiagaraTransform R;
+	R.Translation	= asfloat(RawBufferData.Load3(Offset + 0));
+	R.Rotation		= asfloat(RawBufferData.Load4(Offset + 12));
+	R.Scale			= asfloat(RawBufferData.Load3(Offset + 28));
+	return R;
+}
+
+FNiagaraTransform MakeTransform(float3 Translation, float4 Rotation, float3 Scale)
+{
+	FNiagaraTransform R;
+	R.Translation	= Translation;
+	R.Rotation		= Rotation;
+	R.Scale			= Scale;
+	return R;
+}
+
+FNiagaraTransform MultiplyTransform(in FNiagaraTransform A, in FNiagaraTransform B)
+{
+	FNiagaraTransform R;
+	R.Translation	= RotateVectorByQuat(A.Translation * B.Scale, B.Rotation) + B.Translation;
+	R.Rotation		= MultiplyQuat(B.Rotation, A.Rotation);
+	R.Scale			= A.Scale * B.Scale;
+	return R;
+}

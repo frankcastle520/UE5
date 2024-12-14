@@ -1,0 +1,116 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "../SceneTexturesCommon.ush"
+#include "../LightData.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapProjectionCommon.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapProjectionSpot.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapScreenRayTrace.ush"
+#include "MegaLights.ush"
+#include "MegaLightsRayTracing.ush"
+
+RWTexture2D<uint> RWLightSamples;
+
+Buffer<uint> CompactedTraceTexelAllocator;
+Buffer<uint> CompactedTraceTexelData;
+Texture2D<float> DownsampledSceneDepth;
+Texture2D<UNORM float3> DownsampledSceneWorldNormal;
+
+SCHEDULER_MIN_PRESSURE
+MAX_OCCUPANCY
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void VirtualShadowMapTraceLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TraceTexelIndex = DispatchThreadId.x;
+
+	if (TraceTexelIndex < CompactedTraceTexelAllocator[0])
+	{
+		const uint2 SampleCoord = UnpackTraceTexel(CompactedTraceTexelData[TraceTexelIndex]);
+		FLightSample LightSample = UnpackLightSample(RWLightSamples[SampleCoord]);
+
+		// Get VSM from LocalLightIndex
+		const FLocalLightData LocalLightData = GetLocalLightDataNonStereo(LightSample.LocalLightIndex);
+		const int VirtualShadowMapId = LocalLightData.VirtualShadowMapId;
+
+		// Should we select for this separately in the tile classification instead?
+		if (VirtualShadowMapId != INDEX_NONE)
+		{
+			const FDeferredLightData LightData = ConvertToDeferredLight(LocalLightData);
+
+			uint2 ScreenCoord = SampleCoordToScreenCoord(SampleCoord);
+			uint2 DownsampledScreenCoord = SampleCoordToDownsampledScreenCoord(SampleCoord);
+
+			float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+			float SceneDepth = DownsampledSceneDepth[DownsampledScreenCoord];
+			float3 SceneWorldNormal = normalize(DecodeNormal(DownsampledSceneWorldNormal[DownsampledScreenCoord]));
+			float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+
+			const float3 ToLightDirection = normalize(LightData.TranslatedWorldPosition - TranslatedWorldPosition);
+
+			// Currently using the embedded SMRT ray sampling; could change this to use this one easily if needed
+			//FLightSampleTrace LightSampleTrace = GetLightSampleTrace(TranslatedWorldPosition, LightSample.LocalLightIndex, SampleCoord);
+
+			float StepOffset = BlueNoiseScalar(DownsampledScreenCoord, MegaLightsStateFrameIndex);
+			const float ScreenRayLengthWorld = GetScreenRayLengthMultiplierForProjectionType(VirtualShadowMap.ScreenRayLength * SceneDepth).y;
+
+			// TODO: Avoid doing this normal bias for subsurface pixels
+			// Will need to consider both substrate and downsampling
+			//if (!ShadingInfo.bIsSubsurface)
+			{
+				TranslatedWorldPosition += SceneWorldNormal * VirtualShadowMapGetNormalBiasLength(TranslatedWorldPosition);
+			}
+
+			// VSM screen ray trace
+			float RayStartOffset = ScreenRayLengthWorld;
+			if (ScreenRayLengthWorld > 0.0f)
+			{
+				RayStartOffset = VirtualShadowMapScreenRayCast(
+					TranslatedWorldPosition,
+					ToLightDirection,
+					ScreenRayLengthWorld,
+					StepOffset);
+			}
+
+			// TODO: Back-facing tests? (or BRDF test directly?)
+			// In MegaLights this is already factored into the sample selection though, so less important
+#if 0
+			FVirtualShadowMapSampleResult VSMResult = SampleVirtualShadowMapLocal(
+				VirtualShadowMapId,
+				TranslatedWorldPosition,
+				RayStartOffset,
+				SceneWorldNormal
+			);
+
+			LightSample.bVisible = VSMResult.bValid && VSMResult.ShadowFactor > 0.5f;
+#else
+			FLightShaderParameters LightParameters = ConvertFromLocal(LocalLightData);
+
+			FSMRTTraceSettings Settings = GetSMRTTraceSettingsLocal();
+			Settings.RayCount = 1;
+			Settings.AdaptiveRayCount = 0;
+
+			FVirtualShadowMapSampleResult Result = TraceLocalLight(
+				VirtualShadowMapId,
+				LightParameters,
+				SampleCoord,
+				SceneDepth,
+				TranslatedWorldPosition,
+				RayStartOffset,
+				StepOffset,
+				SceneWorldNormal,
+				Settings
+			);
+
+			LightSample.bVisible = Result.ShadowFactor > 0.5f;
+#endif
+
+			LightSample.bCompleted = true;
+			RWLightSamples[SampleCoord] = PackLightSample(LightSample);
+		}
+	}
+}

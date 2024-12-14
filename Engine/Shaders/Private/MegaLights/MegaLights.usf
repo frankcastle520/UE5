@@ -1,0 +1,208 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// When loading SSS checkerboard pixel, do not adjust DiffuseColor/SpecularColor to preserve specular and diffuse lighting values for each pixel
+#define ALLOW_SSS_MATERIAL_OVERRIDE 0
+
+#include "../Common.ush"
+#include "MegaLightsShading.ush"
+
+groupshared uint SharedTileMode[THREADGROUP_SIZE * THREADGROUP_SIZE];
+
+RWStructuredBuffer<uint> RWTileAllocator;
+RWStructuredBuffer<uint> RWTileData;
+uint TileDataStride;
+uint DownsampledTileDataStride;
+uint2 DownsampledViewMin;
+uint2 DownsampledViewSize;
+uint EnableTexturedRectLights;
+
+#ifdef TileClassificationCS
+
+/**
+ * Run tile classification to generate tiles for each subsequent pass
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void TileClassificationCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint LinearThreadIndex = GroupThreadId.x + THREADGROUP_SIZE * GroupThreadId.y;
+
+	SharedTileMode[LinearThreadIndex] = 0;
+	
+	GroupMemoryBarrierWithGroupSync();
+
+#if DOWNSAMPLED_CLASSIFICATION
+	uint2 ScreenCoord = DispatchThreadId.xy + DownsampledViewMin;
+	if (all(ScreenCoord < DownsampledViewMin + DownsampledViewSize))
+#else
+	uint2 ScreenCoord = DispatchThreadId.xy + View.ViewRectMinAndSize.xy;
+	if (all(ScreenCoord < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+#endif
+	{
+#if DOWNSAMPLED_CLASSIFICATION
+		float2 ScreenUV = DownsampledScreenCoordToScreenUV(ScreenCoord);
+		uint2 EffectiveScreenCoord = DownsampledScreenCoordToScreenCoord(ScreenCoord);
+#else
+		float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+		uint2 EffectiveScreenCoord = ScreenCoord;
+#endif
+		FMegaLightsMaterial Material = LoadMaterial(ScreenUV, EffectiveScreenCoord);
+
+		uint TileMode = 0;
+
+		if (!Material.IsValid())
+		{
+			TileMode = 0x1;
+		}
+		else if (Material.IsSimple())
+		{
+			TileMode = 0x2;
+		}
+		else
+		{
+			TileMode = 0x4;
+		}
+
+		const float SceneDepth = Material.Depth;
+
+		const uint EyeIndex = 0;
+		const uint GridIndex = ComputeLightGridCellIndex(EffectiveScreenCoord - View.ViewRectMin.xy, SceneDepth, EyeIndex);
+		const FCulledLightsGridHeader CulledLightGridHeader = GetCulledLightsGridHeader(GridIndex, EyeIndex);
+
+		if (CulledLightGridHeader.bHasRectLight)
+		{
+			TileMode |= 0x8;
+		}
+
+		if (CulledLightGridHeader.bHasTexturedLight && EnableTexturedRectLights != 0)
+		{
+			TileMode |= 0x10;
+		}
+
+		SharedTileMode[LinearThreadIndex] = TileMode;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// GroupShared reduction
+	if (LinearThreadIndex < 32)
+	{
+		SharedTileMode[LinearThreadIndex] = SharedTileMode[LinearThreadIndex] | SharedTileMode[LinearThreadIndex + 32];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 16)
+	{
+		SharedTileMode[LinearThreadIndex] = SharedTileMode[LinearThreadIndex] | SharedTileMode[LinearThreadIndex + 16];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 8)
+	{
+		SharedTileMode[LinearThreadIndex] = SharedTileMode[LinearThreadIndex] | SharedTileMode[LinearThreadIndex + 8];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 4)
+	{
+		SharedTileMode[LinearThreadIndex] = SharedTileMode[LinearThreadIndex] | SharedTileMode[LinearThreadIndex + 4];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 2)
+	{
+		SharedTileMode[LinearThreadIndex] = SharedTileMode[LinearThreadIndex] | SharedTileMode[LinearThreadIndex + 2];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 1)
+	{
+		SharedTileMode[LinearThreadIndex] = SharedTileMode[LinearThreadIndex] | SharedTileMode[LinearThreadIndex + 1];
+	}
+
+	if (LinearThreadIndex == 0)
+	{
+#if DOWNSAMPLED_CLASSIFICATION
+		const uint DataStride = DownsampledTileDataStride;
+#else
+		const uint DataStride = TileDataStride;
+#endif
+
+		uint2 TileCoord = ScreenCoord / TILE_SIZE;
+
+		int TileMode = -1;
+
+		if (SharedTileMode[0] & 0x4)
+		{
+			TileMode = TILE_MODE_COMPLEX_SHADING;
+
+			if (SharedTileMode[0] & 0x8)
+			{
+				if (SharedTileMode[0] & 0x10)
+				{
+					TileMode = TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED;
+				}
+				else
+				{
+					TileMode = TILE_MODE_COMPLEX_SHADING_RECT;
+				}
+			}
+		}
+		else if (SharedTileMode[0] & 0x2)
+		{
+			TileMode = TILE_MODE_SIMPLE_SHADING;
+
+			if (SharedTileMode[0] & 0x8)
+			{
+				if (SharedTileMode[0] & 0x10)
+				{
+					TileMode = TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED;
+				}
+				else
+				{
+					TileMode = TILE_MODE_SIMPLE_SHADING_RECT;
+				}
+			}
+		}
+		else if (SharedTileMode[0] & 0x1)
+		{
+			TileMode = TILE_MODE_EMPTY;
+		}
+
+		if (TileMode >= 0)
+		{
+			uint MegaLightsTileIndex;
+			InterlockedAdd(RWTileAllocator[TileMode], 1, MegaLightsTileIndex);
+			RWTileData[DataStride * TileMode + MegaLightsTileIndex] = PackTile(TileCoord);
+		}
+	}
+}
+
+#endif
+
+RWBuffer<uint> RWTileIndirectArgs;
+RWBuffer<uint> RWDownsampledTileIndirectArgs;
+StructuredBuffer<uint> TileAllocator;
+StructuredBuffer<uint> DownsampledTileAllocator;
+
+#ifdef InitTileIndirectArgsCS
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void InitTileIndirectArgsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TileMode = DispatchThreadId.x;
+	if (TileMode < TILE_MODE_MAX)
+	{
+		WriteDispatchIndirectArgs(RWTileIndirectArgs, TileMode, TileAllocator[TileMode], 1, 1);
+		WriteDispatchIndirectArgs(RWDownsampledTileIndirectArgs, TileMode, DownsampledTileAllocator[TileMode], 1, 1);
+	}
+}
+
+#endif

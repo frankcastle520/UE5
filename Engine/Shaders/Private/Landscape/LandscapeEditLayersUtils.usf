@@ -1,0 +1,163 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "LandscapeCommon.ush"
+
+// ----------------------------------------------------------------------------------
+
+#if defined (__INTELLISENSE__)
+// Uncomment the appropriate define for enabling syntax highlighting with HLSL Tools for Visual Studio : 
+//#define MARK_VALIDITY 1
+//#define COPY_QUADS 1
+//#define COPY_QUADS_MULTISOURCE 1
+//#define USE_SWIZZLE_MASK 1
+#endif // defined (__INTELLISENSE__)
+
+
+// ----------------------------------------------------------------------------------
+
+#if COPY_QUADS
+// CopyQuadsPS inputs/outputs :
+
+Texture2D<float4> InSourceTexture;
+#endif // COPY_QUADS
+
+#if COPY_QUADS_MULTISOURCE
+// CopyQuadsMultiSourcePS inputs/outputs :
+
+// Helper macro for handling an array of N textures (currently using 63 because 64 is the maximum supported number of SRV on all platforms needing to run this) :
+#define FOREACH_SOURCETEXTURE(op) \
+	op(0) \
+	op(1) \
+	op(2) \
+	op(3) \
+	op(4) \
+	op(5) \
+	op(6) \
+	op(7) \
+	op(8) \
+	op(9) \
+	op(10) \
+	op(11) \
+	op(12) \
+	op(13) \
+	op(14) \
+	op(15) \
+	op(16) \
+	op(17) \
+	op(18) \
+	op(19) \
+	op(20) \
+	op(21) \
+	op(22) \
+	op(23) \
+	op(24) \
+	op(25) \
+	op(26) \
+	op(27) \
+	op(28) \
+	op(29) \
+	op(30) \
+	op(31) \
+	op(32) \
+	op(33) \
+	op(34) \
+	op(35) \
+	op(36) \
+	op(37) \
+	op(38) \
+	op(39) \
+	op(40) \
+	op(41) \
+	op(42) \
+	op(43) \
+	op(44) \
+	op(45) \
+	op(46) \
+	op(47) \
+	op(48) \
+	op(49) \
+	op(50) \
+	op(51) \
+	op(52) \
+	op(53) \
+	op(54) \
+	op(55) \
+	op(56) \
+	op(57) \
+	op(58) \
+	op(59) \
+	op(60) \
+	op(61) \
+	op(62) 
+
+Buffer<uint2> InQuadInfos; // .x = source texture index, .y = swizzle mask
+
+// Define N input textures :
+#define DECLARE_SOURCE_TEXTURE(n) Texture2D<float4> InSourceTexture_##n;
+FOREACH_SOURCETEXTURE(DECLARE_SOURCE_TEXTURE)
+#undef DECLARE_SOURCE_TEXTURE
+#endif // COPY_QUADS_MULTISOURCE
+
+// ----------------------------------------------------------------------------------
+// Pixel shaders : 
+
+#if MARK_VALIDITY
+
+void MarkValidityPS(out float OutValidity : SV_Target0)
+{
+	OutValidity = 1.0f;
+}
+
+#endif // MARK_VALIDITY
+
+
+// ----------------------------------------------------------------------------------
+
+#if COPY_QUADS
+
+void CopyQuadsPS(float4 SvPosition : SV_POSITION, float2 QuadUV : TEXCOORD0, out float4 OutColor : SV_Target0)
+{
+	OutColor = InSourceTexture.SampleLevel(GlobalPointClampedSampler, QuadUV, 0);
+}
+
+#endif // COPY_QUADS
+
+
+// ----------------------------------------------------------------------------------
+
+#if COPY_QUADS_MULTISOURCE
+
+void CopyQuadsMultiSourcePS(float4 SvPosition : SV_POSITION, float2 SourceUV : TEXCOORD0, float2 UnusedQuadUV : TEXCOORD1, float InRectIndex : RECT_INDEX, out float4 OutColor : SV_Target0)
+{
+	OutColor = 0.0f;
+
+	uint QuadIndex = (uint)InRectIndex;
+	int SourceTextureIndex = InQuadInfos[QuadIndex].x;
+
+	BRANCH
+	switch (SourceTextureIndex)
+	{
+#define IMPLEMENT_SAMPLE_SWITCH_CASE(n) case n: OutColor = InSourceTexture_##n.SampleLevel(GlobalPointClampedSampler, SourceUV, 0); break; 
+	FOREACH_SOURCETEXTURE(IMPLEMENT_SAMPLE_SWITCH_CASE);
+#undef IMPLEMENT_SAMPLE_SWITCH_CASE
+
+	default: 
+		break;
+	}
+
+	// Swizzle channels as requested by ChannelSwizzleMask:
+#if USE_SWIZZLE_MASK
+	uint ChannelSwizzleMask = (uint)InQuadInfos[QuadIndex].y;
+	float4 SwizzledColor = 0.0f;
+	[unroll]
+	for (uint DestinationChannelIndex = 0; DestinationChannelIndex < 4; ++DestinationChannelIndex)
+	{
+		uint SourceChannelIndex = ((3u << (DestinationChannelIndex * 2u)) & ChannelSwizzleMask) >> (DestinationChannelIndex * 2u);
+		SwizzledColor[DestinationChannelIndex] = OutColor[SourceChannelIndex];
+	}
+	OutColor = SwizzledColor;
+#endif // USE_SWIZZLE_MASK
+}
+
+#endif // COPY_QUADS_MULTISOURCE

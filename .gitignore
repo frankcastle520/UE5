@@ -17,12 +17,6 @@
 *
 !*/
 
-# Visual Studio 2015 user specific files
-.vs/
-
-# Visual Studio 2015 user specific files
-.idea/
-
 # Compiled Object files
 *.slo
 *.lo
@@ -330,7 +324,7 @@ Engine/Binaries/Android/packageInfo.txt
 enc_temp_folder/
 
 # Ignore content folders
-Content/
+# Content/
 
 # Ignore DDC
 /Engine/DerivedDataCache/**

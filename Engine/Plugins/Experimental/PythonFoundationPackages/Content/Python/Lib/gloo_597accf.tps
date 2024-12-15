@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TpsData xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Name>gloo </Name>
+  <!-- Software Name and Version  -->
+<!-- Software Name: gloo
+    Version: 597accf-->
+<Location>//FN/Main/Engine/Plugins/Experimental/PythonFoundationPackages/PythonFoundationPackages.uplugin</Location>
+  <Function>Used internally by torch. A collective communications library. It comes with a number of collective algorithms useful for machine learning applications.</Function>
+  <Eula>https://github.com/facebookincubator/gloo/blob/main/LICENSE</Eula>
+  <RedistributeTo>
+    <EndUserGroup>Licensees</EndUserGroup>
+    <EndUserGroup>P4</EndUserGroup>
+    <EndUserGroup>Git</EndUserGroup>
+  </RedistributeTo>
+  <LicenseFolder>/Engine/Source/ThirdParty/Licenses</LicenseFolder>
+</TpsData>
+ 
+
+
+ 
